@@ -104,13 +104,13 @@ def load_retinaface(path):
     return model.eval()
 
 
-def export(model, example, out_dir, name):
+def export(model, example, out_dir, name, fp16=True):
     """Traces [model] with pnnx and copies the ncnn files to out_dir/name.{param,bin}."""
     import pnnx
     with tempfile.TemporaryDirectory() as work, torch.no_grad():
         # pnnx names its outputs after the .pt file and turns dashes into underscores.
         stem = name.replace('-', '_')
-        pnnx.export(model, os.path.join(work, f'{stem}.pt'), (example,), fp16=True)
+        pnnx.export(model, os.path.join(work, f'{stem}.pt'), (example,), fp16=fp16)
         for ext in ('param', 'bin'):
             shutil.copyfile(os.path.join(work, f'{stem}.ncnn.{ext}'), os.path.join(out_dir, f'{name}.{ext}'))
 
@@ -155,7 +155,8 @@ def main():
 
     det = load_retinaface(None if a.random else a.retinaface)
     det_in = torch.rand(1, 3, DETECT_SIZE, DETECT_SIZE) * 255 - 117
-    export(det, det_in, a.out, 'retinaface-mnet')
+    # The detector stays fp32: it is tiny, and fp16 weights moved its boxes by up to 15%.
+    export(det, det_in, a.out, 'retinaface-mnet', fp16=False)
 
     gfp = load_gfpgan(None if a.random else a.gfpgan)
     gfp_in = torch.rand(1, 3, GFPGAN_SIZE, GFPGAN_SIZE) * 2 - 1
