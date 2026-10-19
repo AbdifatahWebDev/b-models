@@ -25,7 +25,7 @@ jobs:
       - name: Install converters (CPU PyTorch)
         run: |
           pip install --index-url https://download.pytorch.org/whl/cpu torch
-          pip install "diffusers==0.32.2" numpy pillow pnnx ncnn huggingface_hub
+          pip install "diffusers==0.32.2" numpy pillow pnnx ncnn huggingface_hub pytorch-lightning omegaconf
 
       - name: Download AdcSR weights
         run: |

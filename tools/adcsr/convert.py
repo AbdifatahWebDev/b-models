@@ -43,6 +43,15 @@ SD21_UNET = dict(
 )
 
 
+def report(name, result):
+    missing, unexpected = result
+    print(f"{name}: {len(missing)} missing, {len(unexpected)} unexpected")
+    if missing or unexpected:
+        print("  missing:", missing[:8])
+        print("  unexpected:", unexpected[:8])
+        raise SystemExit(f"{name} weights don't match the model")
+
+
 def build(weights, decoder_ckpt):
     from diffusers import UNet2DConditionModel
     from diffusers.models.autoencoders.vae import Decoder
@@ -53,11 +62,20 @@ def build(weights, decoder_ckpt):
                       block_out_channels=[64, 128, 256, 256], layers_per_block=2, norm_num_groups=32,
                       act_fn="silu", norm_type="group", mid_block_add_attention=True)
     if decoder_ckpt:
-        state = torch.load(decoder_ckpt, map_location="cpu", weights_only=False)["state_dict"]
-        decoder.load_state_dict({k.replace("decoder.", ""): v for k, v in state.items() if "decoder" in k}, strict=True)
-    net = nn.DataParallel(Net(unet, copy.deepcopy(decoder)))
+        ckpt = torch.load(decoder_ckpt, map_location="cpu", weights_only=False)
+        state = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+        dec = {k.split("decoder.", 1)[1]: v for k, v in state.items() if "decoder." in k}
+        print(f"decoder checkpoint: {len(state)} tensors, {len(dec)} for the decoder")
+        report("decoder", decoder.load_state_dict(dec, strict=False))
+    net = Net(unet, copy.deepcopy(decoder))
     if weights:
-        net.load_state_dict(torch.load(weights, map_location="cpu", weights_only=False))
+        state = torch.load(weights, map_location="cpu", weights_only=False)
+        if not isinstance(state, dict):
+            state = state.state_dict()
+        state = {k.removeprefix("module."): v for k, v in state.items()}
+        print(f"net_params: {len(state)} tensors")
+        report("net", net.load_state_dict(state, strict=False))
+    net = nn.DataParallel(net)
     model = nn.Sequential(net.module, *decoder.up_blocks, decoder.conv_norm_out, decoder.conv_act, decoder.conv_out)
     return model.eval()
 
