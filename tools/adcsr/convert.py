@@ -77,7 +77,19 @@ def build(weights, decoder_ckpt):
         report("net", net.load_state_dict(state, strict=False))
     net = nn.DataParallel(net)
     model = nn.Sequential(net.module, *decoder.up_blocks, decoder.conv_norm_out, decoder.conv_act, decoder.conv_out)
-    return model.eval()
+    return Named(model).eval()
+
+
+class Named(nn.Module):
+    """pnnx writes a Python file named after the layers: a top-level nn.Sequential gives names
+    like `0_body_0`, which aren't valid Python. Under an attribute they become `net_0_body_0`."""
+
+    def __init__(self, net):
+        super().__init__()
+        self.net = net
+
+    def forward(self, x):
+        return self.net(x)
 
 
 def export(model, out_dir, name, fp16=True):
