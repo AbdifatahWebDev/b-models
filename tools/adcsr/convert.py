@@ -76,7 +76,19 @@ def build(weights, decoder_ckpt):
         print(f"net_params: {len(state)} tensors")
         report("net", net.load_state_dict(state, strict=False))
     net = nn.DataParallel(net)
+    # AdcSR keeps the UNet's blocks both as attributes and inside unet.body. pnnx can't convert
+    # a module registered under two names (it leaves `nn.GroupNorm` in the ncnn file and drops
+    # the conv), so drop the attribute names once the weights are loaded; forward uses body.
+    unet = net.module.body[1]
+    for attr in ("down_blocks", "mid_block", "up_blocks", "conv_norm_out", "conv_act", "conv_out"):
+        if hasattr(unet, attr):
+            delattr(unet, attr)
     model = nn.Sequential(net.module, *decoder.up_blocks, decoder.conv_norm_out, decoder.conv_act, decoder.conv_out)
+    # diffusers shares one SiLU instance between blocks; give every use its own (not in place).
+    for parent in list(model.modules()):
+        for name, child in list(parent.named_children()):
+            if isinstance(child, nn.SiLU):
+                setattr(parent, name, nn.SiLU())
     return Named(model).eval()
 
 
