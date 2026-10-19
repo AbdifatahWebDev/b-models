@@ -39,10 +39,32 @@ jobs:
           PY
           find weights -type f -exec ls -la {} \;
 
+      # pnnx needs more than the runner's 16 GB of RAM for a 456 M parameter model.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
       - name: Convert to ncnn and check against PyTorch
         run: |
+          set -o pipefail
+          mkdir -p dist
           python tools/adcsr/convert.py --check --out dist \
-            --weights "$(find weights -name net_params_200.pkl)" --decoder "$(find weights -name halfDecoder.ckpt)"
+            --weights "$(find weights -name net_params_200.pkl)" --decoder "$(find weights -name halfDecoder.ckpt)" \
+            2>&1 | grep -v -E "^(inline module|fallback batch)" | tee convert.log
+
+      # The log goes to a release so it can be read without opening Actions.
+      - name: Publish the log
+        if: always()
+        run: |
+          free -h >> convert.log || true
+          dmesg 2>/dev/null | grep -i -E "oom|killed" | tail -5 >> convert.log || true
+          gh release delete "$TAG-log" --yes --cleanup-tag || true
+          gh release create "$TAG-log" convert.log --prerelease --title "AdcSR test log" --notes "Log of the last AdcSR test run.""
 
       - name: Publish the test release
         run: |
