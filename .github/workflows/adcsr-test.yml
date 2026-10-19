@@ -63,7 +63,11 @@ jobs:
         run: |
           free -h >> convert.log 2>&1 || true
           sudo dmesg 2>/dev/null | grep -i -E "oom|killed" | tail -5 >> convert.log || true
-          tail -n 45 convert.log | sed 's/%/%25/g' | while IFS= read -r line; do echo "::warning::${line:0:300}"; done
+          # One annotation (GitHub keeps only 10 per step): errors first, then the last lines.
+          { grep -n -i -E "error|traceback|exception|killed|segmentation|abort|unsupported|not supported" convert.log | tail -n 25
+            echo "----- tail -----"
+            grep -v -E "^ignore " convert.log | tail -n 40; } > report.txt
+          python3 -c "import sys; t=open('report.txt').read()[-12000:]; print('::warning::' + t.replace('%','%25').replace('\r','').replace('\n','%0A'))"
 
       - name: Publish the test release
         run: |
