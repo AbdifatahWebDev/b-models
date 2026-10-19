@@ -1,0 +1,52 @@
+name: AdcSR test
+
+# Research spike: converts AdcSR (one-step diffusion 4x upscaler, CVPR 2025) to ncnn and
+# publishes it as a pre-release, so it can be tested before going into the app. Manual only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: adcsr-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install converters (CPU PyTorch)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install "diffusers==0.32.2" numpy pillow pnnx ncnn huggingface_hub
+
+      - name: Download AdcSR weights
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download, list_repo_files
+          files = list_repo_files("Guaishou74851/AdcSR")
+          print("\n".join(f for f in files if f.endswith((".pkl", ".ckpt"))))
+          for name in ("net_params_200.pkl", "halfDecoder.ckpt"):
+              path = next(f for f in files if f.endswith(name))
+              print("downloaded", hf_hub_download("Guaishou74851/AdcSR", path, local_dir="weights"))
+          PY
+          find weights -type f -exec ls -la {} \;
+
+      - name: Convert to ncnn and check against PyTorch
+        run: |
+          python tools/adcsr/convert.py --check --out dist \
+            --weights "$(find weights -name net_params_200.pkl)" --decoder "$(find weights -name halfDecoder.ckpt)"
+
+      - name: Publish the test release
+        run: |
+          cp tools/adcsr/LICENSE-AdcSR dist/LICENSE-AdcSR.txt
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" dist/* --prerelease --title "AdcSR test (not used by the app)" \
+            --notes "AdcSR x4 converted to ncnn for a Brekwol research test. Code Apache-2.0; weights derived from Stable Diffusion 2.1-base (CreativeML Open RAIL++-M)."
