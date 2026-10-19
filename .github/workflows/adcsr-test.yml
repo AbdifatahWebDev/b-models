@@ -57,14 +57,13 @@ jobs:
             --weights "$(find weights -name net_params_200.pkl)" --decoder "$(find weights -name halfDecoder.ckpt)" \
             2>&1 | grep -v -E "^(inline module|fallback batch)" | tee convert.log
 
-      # The log goes to a release so it can be read without opening Actions.
-      - name: Publish the log
+      # Annotations can be read through the API, so the end of the log goes there too.
+      - name: Report the log
         if: always()
         run: |
-          free -h >> convert.log || true
-          dmesg 2>/dev/null | grep -i -E "oom|killed" | tail -5 >> convert.log || true
-          gh release delete "$TAG-log" --yes --cleanup-tag || true
-          gh release create "$TAG-log" convert.log --prerelease --title "AdcSR test log" --notes "Log of the last AdcSR test run.""
+          free -h >> convert.log 2>&1 || true
+          sudo dmesg 2>/dev/null | grep -i -E "oom|killed" | tail -5 >> convert.log || true
+          tail -n 45 convert.log | sed 's/%/%25/g' | while IFS= read -r line; do echo "::warning::${line:0:300}"; done
 
       - name: Publish the test release
         run: |
