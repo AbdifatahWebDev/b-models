@@ -1,0 +1,61 @@
+name: Face models
+
+# Builds release models-v2: everything in models-v1 plus face restoration (GFPGAN v1.4 and the
+# RetinaFace detector), converted to ncnn by tools/face/convert.py. Started by hand only.
+# This repository is public, so its Actions minutes are free.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release to create
+        default: models-v2
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install converters (CPU PyTorch)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pnnx ncnn
+
+      - name: Download the original weights
+        run: |
+          mkdir -p weights
+          curl -fL --retry 3 -o weights/GFPGANv1.4.pth \
+            https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth
+          curl -fL --retry 3 -o weights/detection_mobilenet0.25_Final.pth \
+            https://github.com/xinntao/facexlib/releases/download/v0.1.0/detection_mobilenet0.25_Final.pth
+          sha256sum weights/*
+
+      - name: Convert to ncnn and check against PyTorch
+        run: |
+          python tools/face/convert.py --check --out dist \
+            --gfpgan weights/GFPGANv1.4.pth --retinaface weights/detection_mobilenet0.25_Final.pth
+
+      - name: Add the models-v1 files and licenses
+        run: |
+          gh release download models-v1 --dir dist --clobber
+          cp tools/face/LICENSE-GFPGAN dist/LICENSE-GFPGAN.txt
+          cp tools/face/LICENSE-facexlib dist/LICENSE-facexlib.txt
+          rm -f dist/models.json
+          python tools/make-manifest.py dist -o dist/models.json
+          ls -la dist
+
+      - name: Publish the release
+        run: |
+          gh release create "$TAG" dist/* --title "Models ($TAG)" --notes-file tools/face/RELEASE.md

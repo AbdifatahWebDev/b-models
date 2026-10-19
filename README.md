@@ -12,6 +12,8 @@ file with its size and SHA-256. The app checks both before it installs a model.
 | Real-ESRGAN Anime | `realesrgan-x4plus-anime.*` | Illustrations, comics, anime | BSD-3-Clause (Real-ESRGAN), MIT (ncnn conversion) |
 | SwinIR | `swinir-x4.*` | Finest detail and edges | Apache-2.0 |
 | SCUNet | `scunet-color.*` | Noisy, compressed or old scans | Apache-2.0 (code), MIT (KAIR weights release) |
+| GFPGAN v1.4 (from `models-v2`) | `gfpgan-1.4.*` | Face restore | Apache-2.0 (code); weights trained on FFHQ (non-commercial dataset) |
+| RetinaFace MobileNet 0.25 (from `models-v2`) | `retinaface-mnet.*` | Finds faces for GFPGAN | MIT (facexlib) |
 
 ## Sources
 
@@ -25,6 +27,10 @@ file with its size and SHA-256. The app checks both before it installs a model.
   Converted to ncnn from the authors' `scunet_color_real_psnr` weights (published in
   https://github.com/cszn/KAIR, MIT), with fp16 weights and a
   fixed 256×256 input.
+- GFPGAN by Xintao Wang et al. — https://github.com/TencentARC/GFPGAN (`GFPGANv1.4.pth`), and
+  RetinaFace from facexlib — https://github.com/xinntao/facexlib (`detection_mobilenet0.25_Final.pth`).
+  Converted by `tools/face/convert.py` in the **Face models** workflow, which checks the ncnn
+  output against PyTorch. Run it from the Actions tab to rebuild `models-v2`.
 
 The converted SwinIR and SCUNet files are modified versions of the original works: the
 window-attention layers were rewritten so ncnn can run them, with the same results (checked
