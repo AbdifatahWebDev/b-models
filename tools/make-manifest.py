@@ -21,6 +21,8 @@ MODELS = {
     "scunet": ["scunet-color.param", "scunet-color.bin"],
     # Face restore: GFPGAN plus the RetinaFace detector that finds the faces.
     "gfpgan": ["gfpgan-1.4.param", "gfpgan-1.4.bin", "retinaface-mnet.param", "retinaface-mnet.bin"],
+    # Generative: AdcSR one-step diffusion (tools/adcsr), fixed 128 px tiles.
+    "adcsr": ["adcsr-x4.param", "adcsr-x4.bin"],
 }
 
 

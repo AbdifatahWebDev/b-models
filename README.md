@@ -14,6 +14,7 @@ file with its size and SHA-256. The app checks both before it installs a model.
 | SCUNet | `scunet-color.*` | Noisy, compressed or old scans | Apache-2.0 (code), MIT (KAIR weights release) |
 | GFPGAN v1.4 (from `models-v2`) | `gfpgan-1.4.*` | Face restore | Apache-2.0 (code); weights trained on FFHQ (non-commercial dataset) |
 | RetinaFace MobileNet 0.25 (from `models-v2`) | `retinaface-mnet.*` | Finds faces for GFPGAN | MIT (facexlib) |
+| AdcSR (from `models-v3`) | `adcsr-x4.*` | Generative upscale (slow, small photos) | Apache-2.0 (code); weights from SD 2.1-base, CreativeML Open RAIL++-M |
 
 ## Sources
 
@@ -31,6 +32,10 @@ file with its size and SHA-256. The app checks both before it installs a model.
   RetinaFace from facexlib — https://github.com/xinntao/facexlib (`detection_mobilenet0.25_Final.pth`).
   Converted by `tools/face/convert.py` in the **Face models** workflow, which checks the ncnn
   output against PyTorch. Run it from the Actions tab to rebuild `models-v2`.
+
+- AdcSR by Bin Chen et al. — https://github.com/Guaishou74851/AdcSR (`net_params_200.pkl`,
+  `halfDecoder.ckpt`), converted by `tools/adcsr/convert.py` in the **AdcSR test** workflow;
+  the **Models v3** workflow adds it to `models-v3`.
 
 The converted SwinIR and SCUNet files are modified versions of the original works: the
 window-attention layers were rewritten so ncnn can run them, with the same results (checked

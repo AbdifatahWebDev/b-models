@@ -1,0 +1,34 @@
+name: Models v3
+
+# Publishes release models-v3: everything in models-v2 plus the AdcSR generative upscaler from
+# the adcsr-test release (built by the AdcSR test workflow). Started by hand only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: models-v3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect the files
+        run: |
+          mkdir -p dist
+          gh release download models-v2 --dir dist --clobber
+          gh release download adcsr-test --dir dist --clobber --pattern 'adcsr-x4.*' --pattern 'LICENSE-AdcSR.txt'
+          cp tools/adcsr/LICENSE-AdcSR dist/LICENSE-AdcSR.txt
+          rm -f dist/models.json
+          python3 tools/make-manifest.py dist -o dist/models.json
+          ls -la dist
+
+      - name: Publish the release
+        run: |
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" dist/* --title "Models ($TAG)" --notes-file tools/adcsr/RELEASE.md
