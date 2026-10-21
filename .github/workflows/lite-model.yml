@@ -1,0 +1,58 @@
+name: Real-ESRGAN Lite
+
+# Adds Real-ESRGAN Lite (x2plus) to release models-v3: built from the official weights by
+# tools/lite/build.py, checked against PyTorch, then models.json is updated. Started by hand only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: models-v3
+      WEIGHTS_URL: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth
+      WEIGHTS_SHA256: 49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy ncnn
+
+      - name: Fetch inputs
+        run: |
+          mkdir -p work dist
+          curl -sSfL -o work/RealESRGAN_x2plus.pth "$WEIGHTS_URL"
+          echo "$WEIGHTS_SHA256  work/RealESRGAN_x2plus.pth" | sha256sum -c -
+          gh release download "$TAG" --dir work --pattern 'realesrgan-x4plus.param' --pattern 'models.json'
+
+      - name: Build and verify
+        run: python3 tools/lite/build.py work/RealESRGAN_x2plus.pth work/realesrgan-x4plus.param dist
+
+      - name: Add to models.json
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          m = json.load(open("work/models.json"))
+          files = []
+          for name in ("realesrgan-x2plus.param", "realesrgan-x2plus.bin"):
+              p = os.path.join("dist", name)
+              files.append({"name": name, "size": os.path.getsize(p), "sha256": hashlib.sha256(open(p, "rb").read()).hexdigest()})
+          m["models"] = [x for x in m["models"] if x["id"] != "realesrgan-x2plus"] + [{"id": "realesrgan-x2plus", "files": files}]
+          with open("dist/models.json", "w", newline="\n") as f:
+              f.write(json.dumps(m, indent=2) + "\n")
+          print([x["id"] for x in m["models"]])
+          PY
+
+      - name: Upload to the release
+        run: gh release upload "$TAG" dist/realesrgan-x2plus.param dist/realesrgan-x2plus.bin dist/models.json --clobber

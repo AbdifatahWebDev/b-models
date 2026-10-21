@@ -9,6 +9,7 @@ file with its size and SHA-256. The app checks both before it installs a model.
 | Model | Files | Use | License |
 |---|---|---|---|
 | Real-ESRGAN x4plus | `realesrgan-x4plus.*` | Everyday photos | BSD-3-Clause (Real-ESRGAN), MIT (ncnn conversion) |
+| Real-ESRGAN Lite (x2plus) | `realesrgan-x2plus.*` | Direct 2× (built by `tools/lite/build.py`, workflow "Real-ESRGAN Lite") | BSD-3-Clause (Real-ESRGAN) |
 | Real-ESRGAN Anime | `realesrgan-x4plus-anime.*` | Illustrations, comics, anime | BSD-3-Clause (Real-ESRGAN), MIT (ncnn conversion) |
 | SwinIR | `swinir-x4.*` | Finest detail and edges | Apache-2.0 |
 | SCUNet | `scunet-color.*` | Noisy, compressed or old scans | Apache-2.0 (code), MIT (KAIR weights release) |
