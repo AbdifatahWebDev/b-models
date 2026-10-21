@@ -1,0 +1,61 @@
+name: VOSR fetch (test)
+
+# Copies VOSR 0.5B one-step (CVPR 2026, Apache-2.0) and the parts it needs from Hugging Face
+# into release vosr-test, so it can be compared with AdcSR where Hugging Face is unreachable.
+# Test only: nothing here ships in the app. Started by hand only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: vosr-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download from Hugging Face
+        run: |
+          pip install -q "huggingface_hub>=0.25"
+          python3 - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              "CSWRY/VOSR", local_dir="ckpts",
+              allow_patterns=[
+                  "VOSR_0.5B_os/*", "VOSR_0.5B_os/checkpoints/*",
+                  "stable-diffusion-2-1-base/vae/config.json",
+                  "stable-diffusion-2-1-base/vae/diffusion_pytorch_model.safetensors",
+                  "sd21_lwdecoder.pth",
+                  "torch_cache/checkpoints/dinov2_vitb14_pretrain.pth",
+                  "torch_cache/checkpoints/dinov2_vitl14_pretrain.pth",
+                  "torch_cache/facebookresearch_dinov2_main/*",
+                  "torch_cache/facebookresearch_dinov2_main/**",
+              ],
+          )
+          PY
+          cat ckpts/VOSR_0.5B_os/args.json
+          du -sh ckpts/*
+
+      - name: Pack
+        run: |
+          mkdir -p dist
+          cp ckpts/VOSR_0.5B_os/checkpoints/ema_model.safetensors dist/vosr-0.5b-os.safetensors
+          cp ckpts/VOSR_0.5B_os/args.json dist/vosr-0.5b-os-args.json
+          cp ckpts/stable-diffusion-2-1-base/vae/diffusion_pytorch_model.safetensors dist/sd21-vae.safetensors
+          cp ckpts/stable-diffusion-2-1-base/vae/config.json dist/sd21-vae-config.json
+          cp ckpts/sd21_lwdecoder.pth dist/sd21-lwdecoder.pth
+          # The encoder named in args.json (DINOv2 B or L) and its hub code.
+          for f in ckpts/torch_cache/checkpoints/dinov2_*.pth; do cp "$f" dist/; done
+          tar -C ckpts/torch_cache -czf dist/dinov2-hub-code.tar.gz facebookresearch_dinov2_main
+          ls -la dist
+
+      - name: Publish
+        run: |
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --prerelease --title "VOSR test files" \
+            --notes "VOSR 0.5B one-step (Apache-2.0, github.com/cswry/VOSR) with the SD2.1 VAE (CreativeML Open RAIL++-M) and DINOv2 (Apache-2.0), for comparison with AdcSR. Not used by the app."
+          gh release upload "$TAG" dist/* --clobber
