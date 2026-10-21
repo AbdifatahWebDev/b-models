@@ -1,0 +1,84 @@
+name: Compare generative (test)
+
+# Runs Real-ESRGAN and AdcSR (the app's ncnn files) and VOSR 0.5B one-step (CVPR 2026, its own
+# PyTorch code) on small public low-quality photos at 4x, and posts side-by-side sheets to
+# release vosr-test. Test only. Started by hand only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: vosr-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install "diffusers==0.35.0" "timm==1.0.11" einops fairscale safetensors opencv-python-headless \
+            pillow numpy tqdm ncnn "huggingface_hub>=0.25" accelerate
+
+      - name: Test photos (public samples, shrunk to 240 px like a small phone photo)
+        run: |
+          git clone -q --depth 1 https://github.com/TencentARC/GFPGAN gfpgan
+          git clone -q --depth 1 https://github.com/cswry/VOSR vosr
+          mkdir -p inputs
+          python3 - <<'PY'
+          import glob, os
+          from PIL import Image
+          paths = sorted(glob.glob("gfpgan/inputs/whole_imgs/*")) + sorted(glob.glob("vosr/preset/datasets/inp_data/*"))
+          for p in paths:
+              im = Image.open(p).convert("RGB")
+              stem = os.path.splitext(os.path.basename(p))[0]
+              if "inp_data" in p:
+                  # Real camera photo: a 240 px centre crop keeps its native blur and noise.
+                  w, h = im.size
+                  im = im.crop(((w - 240) // 2, (h - 240) // 2, (w + 240) // 2, (h + 240) // 2))
+              else:
+                  f = 240 / max(im.size)
+                  if f < 1:
+                      im = im.resize((round(im.width * f), round(im.height * f)), Image.LANCZOS)
+              im.save(f"inputs/{stem}.png")
+              print(stem, im.size)
+          PY
+
+      - name: VOSR 0.5B one-step
+        run: |
+          python3 - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download("CSWRY/VOSR", local_dir="vosr/preset/ckpts", allow_patterns=[
+              "VOSR_0.5B_os/*", "VOSR_0.5B_os/checkpoints/*",
+              "stable-diffusion-2-1-base/vae/config.json",
+              "stable-diffusion-2-1-base/vae/diffusion_pytorch_model.safetensors",
+              "sd21_lwdecoder.pth",
+          ])
+          PY
+          cd vosr
+          start=$(date +%s)
+          python3 inference_vosr_onestep.py -c preset/ckpts/VOSR_0.5B_os -i ../inputs -o ../vosr_out -u 4
+          echo "VOSR total $(( $(date +%s) - start )) s for $(ls ../inputs | wc -l) photos (includes loading)" | tee ../vosr_time.txt
+
+      - name: App models and sheets
+        run: |
+          mkdir -p models results
+          gh release download models-v3 --dir models --pattern 'adcsr-x4.*' --pattern 'realesrgan-x4plus.*'
+          python3 tools/compare/compare.py inputs models vosr_out results
+          cat vosr_time.txt >> results/compare-times.txt
+          cat results/compare-times.txt
+          ls -la results
+
+      - name: Publish
+        run: |
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --prerelease --title "VOSR test files" --notes "Comparison files. Not used by the app."
+          gh release upload "$TAG" results/* --clobber
