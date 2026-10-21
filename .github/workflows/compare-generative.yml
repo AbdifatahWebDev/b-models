@@ -49,8 +49,12 @@ jobs:
                   f = 240 / max(im.size)
                   if f < 1:
                       im = im.resize((round(im.width * f), round(im.height * f)), Image.LANCZOS)
-              # VOSR needs sides divisible by 16 (its latent patches); crop the remainder.
-              im = im.crop((0, 0, im.width // 16 * 16, im.height // 16 * 16))
+              # VOSR only runs on square inputs with sides divisible by 16: a centred square crop
+              # (the upper part for portraits, where the faces are).
+              side = min(im.width, im.height) // 16 * 16
+              x0 = (im.width - side) // 2
+              y0 = 0 if im.height > im.width else (im.height - side) // 2
+              im = im.crop((x0, y0, x0 + side, y0 + side))
               im.save(f"inputs/{stem}.png")
               print(stem, im.size)
           PY
