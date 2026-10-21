@@ -19,7 +19,9 @@ from PIL import Image, ImageDraw, ImageOps
 
 def net(models, base, fp32=True, lean=False):
     n = ncnn.Net()
-    n.opt.use_fp16_storage = n.opt.use_fp16_packed = n.opt.use_fp16_arithmetic = not fp32
+    # fp16 storage only: x86 runners have no fp16 arithmetic (it gave Real-ESRGAN a blue screen).
+    n.opt.use_fp16_storage = n.opt.use_fp16_packed = not fp32
+    n.opt.use_fp16_arithmetic = False
     if lean:
         n.opt.use_winograd_convolution = False
         n.opt.use_sgemm_convolution = False
@@ -30,10 +32,16 @@ def net(models, base, fp32=True, lean=False):
 
 
 def run(n, chw, inp, out):
+    # ncnn.Mat borrows the array's memory: keep the array alive until extract() has run (a
+    # temporary here was freed first and the models read garbage).
+    arr = np.ascontiguousarray(chw, dtype=np.float32)
+    mat = ncnn.Mat(arr)
     ex = n.create_extractor()
-    ex.input(inp, ncnn.Mat(np.ascontiguousarray(chw)))
+    ex.input(inp, mat)
     _, o = ex.extract(out)
-    return np.array(o)
+    result = np.array(o).copy()
+    del ex, mat, arr
+    return result
 
 
 def realesrgan(n, img):
@@ -98,7 +106,7 @@ def label(img, text):
 def main():
     inp, models, vosr_dir, out_dir = sys.argv[1:5]
     os.makedirs(out_dir, exist_ok=True)
-    esr = net(models, "realesrgan-x4plus", fp32=False)
+    esr = net(models, "realesrgan-x4plus", fp32=True)
     adc = net(models, "adcsr-x4", fp32=True, lean=True)
     times = []
     for name in sorted(os.listdir(inp)):

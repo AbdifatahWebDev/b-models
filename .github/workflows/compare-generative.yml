@@ -49,6 +49,8 @@ jobs:
                   f = 240 / max(im.size)
                   if f < 1:
                       im = im.resize((round(im.width * f), round(im.height * f)), Image.LANCZOS)
+              # VOSR needs sides divisible by 16 (its latent patches); crop the remainder.
+              im = im.crop((0, 0, im.width // 16 * 16, im.height // 16 * 16))
               im.save(f"inputs/{stem}.png")
               print(stem, im.size)
           PY
