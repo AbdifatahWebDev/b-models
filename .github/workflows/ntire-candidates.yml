@@ -1,0 +1,87 @@
+name: NTIRE mobile candidates (test)
+
+# Runs two NTIRE 2026 Mobile Real-World SR entries (Antman: fine-tuned Real-ESRGAN; Samsung:
+# mobile one-step diffusion) next to the app's Real-ESRGAN and AdcSR on small public photos,
+# posts side-by-side sheets and CPU times to release ntire-test, and keeps the two checkpoints
+# as a 7-day artifact for conversion. Test only. Started by hand only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ntire-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install "diffusers==0.32.2" "transformers<4.56" gdown pillow numpy ncnn opencv-python-headless
+
+      - name: Challenge code and weights
+        run: |
+          git clone -q --depth 1 https://github.com/jiatongli2024/NTIRE2026_Mobile_RealWorld_ImageSR challenge
+          python3 tools/ntire/candidates.py fetch zoo
+          find zoo -type f -printf '%s %p\n' | sort -n
+
+      - name: Test photos (public samples, shrunk to 240 px like a small phone photo)
+        run: |
+          git clone -q --depth 1 https://github.com/TencentARC/GFPGAN gfpgan
+          git clone -q --depth 1 https://github.com/cswry/VOSR vosr
+          mkdir -p inputs
+          python3 - <<'PY'
+          import glob, os
+          from PIL import Image
+          paths = sorted(glob.glob("gfpgan/inputs/whole_imgs/*")) + sorted(glob.glob("vosr/preset/datasets/inp_data/*"))
+          for p in paths:
+              im = Image.open(p).convert("RGB")
+              stem = os.path.splitext(os.path.basename(p))[0]
+              if "inp_data" in p:
+                  w, h = im.size
+                  im = im.crop(((w - 240) // 2, (h - 240) // 2, (w + 240) // 2, (h + 240) // 2))
+              else:
+                  f = 240 / max(im.size)
+                  if f < 1:
+                      im = im.resize((round(im.width * f), round(im.height * f)), Image.LANCZOS)
+              # Sides in multiples of 16 (Samsung's model needs them).
+              im = im.crop((0, 0, im.width // 16 * 16, im.height // 16 * 16))
+              im.save(f"inputs/{stem}.png")
+              print(stem, im.size)
+          PY
+
+      - name: Run the entries
+        run: python3 tools/ntire/candidates.py run challenge zoo inputs cands
+
+      - name: Sheets with the app's models
+        if: always()
+        run: |
+          mkdir -p models results
+          gh release download models-v3 --dir models --pattern 'adcsr-x4.*' --pattern 'realesrgan-x4plus.*'
+          python3 tools/ntire/candidates.py sheets inputs models cands results
+          cp cands/candidate-times.txt results/ 2>/dev/null || true
+          cat results/*times.txt
+
+      - name: Keep the checkpoints (7 days, for conversion)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ntire-weights
+          path: zoo
+          retention-days: 7
+
+      - name: Publish
+        if: always()
+        run: |
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --prerelease --title "NTIRE mobile test files" --notes "Comparison files. Not used by the app."
+          gh release upload "$TAG" results/* --clobber
