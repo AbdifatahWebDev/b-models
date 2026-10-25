@@ -27,13 +27,15 @@ jobs:
       - name: Install
         run: |
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install "diffusers==0.32.2" "transformers<4.56" gdown pillow numpy ncnn opencv-python-headless
+          pip install "diffusers==0.32.2" "transformers<4.56" "gdown==6.4.2" pillow numpy ncnn opencv-python-headless
 
       - name: Challenge code and weights
         run: |
           git clone -q --depth 1 https://github.com/jiatongli2024/NTIRE2026_Mobile_RealWorld_ImageSR challenge
-          python3 tools/ntire/candidates.py fetch zoo
-          find zoo -type f -printf '%s %p\n' | sort -n
+          mkdir -p results zoo
+          # Logs go to the release too: job logs can't be read from outside.
+          python3 tools/ntire/candidates.py fetch zoo 2>&1 | tee results/log-fetch.txt
+          find zoo -type f -printf '%s %p\n' | sort -n | tee -a results/log-fetch.txt
 
       - name: Test photos (public samples, shrunk to 240 px like a small phone photo)
         run: |
@@ -61,14 +63,14 @@ jobs:
           PY
 
       - name: Run the entries
-        run: python3 tools/ntire/candidates.py run challenge zoo inputs cands
+        run: python3 tools/ntire/candidates.py run challenge zoo inputs cands 2>&1 | tee results/log-run.txt
 
       - name: Sheets with the app's models
         if: always()
         run: |
           mkdir -p models results
           gh release download models-v3 --dir models --pattern 'adcsr-x4.*' --pattern 'realesrgan-x4plus.*'
-          python3 tools/ntire/candidates.py sheets inputs models cands results
+          python3 tools/ntire/candidates.py sheets inputs models cands results 2>&1 | tee results/log-sheets.txt
           cp cands/candidate-times.txt results/ 2>/dev/null || true
           cat results/*times.txt
 

@@ -37,7 +37,7 @@ def fetch(zoo):
     """Lists the Drive folder, then downloads only the files of the teams in TEAMS (the folder
     also holds several Stable Diffusion copies, gigabytes each)."""
     import gdown
-    files = gdown.download_folder(url=DRIVE, output=zoo, skip_download=True, quiet=True, remaining_ok=True)
+    files = gdown.download_folder(url=DRIVE, output=zoo, skip_download=True, quiet=True)
     print(f'{len(files)} files in the Drive folder:')
     for f in files:
         print('  ', os.path.relpath(f.local_path, zoo))
