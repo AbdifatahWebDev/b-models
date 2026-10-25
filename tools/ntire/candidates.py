@@ -33,27 +33,58 @@ SD21_UNET = dict(
 )
 
 
+def list_drive(folder_id, path, keep, out):
+    """Walks a public Drive folder through its embedded view (what gdown reads), descending only
+    into folders [keep] accepts. gdown's own walk stops at the first folder that isn't shared
+    (one in the challenge folder isn't), so the walk is done here, one folder at a time."""
+    import re
+    import bs4
+    import requests
+    res = requests.get('https://drive.google.com/embeddedfolderview', params={'id': folder_id}, timeout=60)
+    if res.status_code != 200:
+        print(f'  skipped {path or "/"}: status {res.status_code}')
+        return
+    for a in bs4.BeautifulSoup(res.text, 'html.parser').find_all('a'):
+        href, name = a.get('href', ''), a.get_text(strip=True)
+        rel = f'{path}/{name}' if path else name
+        f = re.match(r'https://drive\.google\.com/file/d/([-\w]{25,})/view', href)
+        if f:
+            out.append((f.group(1), rel))
+            continue
+        d = re.search(r'/drive/folders/([-\w]{25,})', href)
+        if d:
+            print('  folder', rel)
+            if keep(rel):
+                list_drive(d.group(1), rel, keep, out)
+
+
 def fetch(zoo):
-    """Lists the Drive folder, then downloads only the files of the teams in TEAMS (the folder
+    """Lists the challenge's Drive folder and downloads only the files of the teams in TEAMS (it
     also holds several Stable Diffusion copies, gigabytes each)."""
     import gdown
-    files = gdown.download_folder(url=DRIVE, output=zoo, skip_download=True, quiet=True)
-    print(f'{len(files)} files in the Drive folder:')
-    for f in files:
-        print('  ', os.path.relpath(f.local_path, zoo))
-    for f in files:
-        rel = os.path.relpath(f.local_path, zoo).lower()
-        if not any(any(k in rel for k in keys) for keys in TEAMS.values()):
+    folder = DRIVE.rsplit('/', 1)[-1]
+
+    def wanted(rel):
+        rel = rel.lower()
+        return any(any(k in rel for k in keys) for keys in TEAMS.values())
+
+    files = []
+    print('Drive folder:')
+    list_drive(folder, '', wanted, files)
+    for fid, rel in files:
+        print('  file', rel)
+    for fid, rel in files:
+        low = rel.lower()
+        if not wanted(rel) or '/text_encoder/' in low or '/vae/' in low or 'tokenizer' in low:
             continue
-        if '/text_encoder/' in rel or '/vae/' in rel or 'tokenizer' in rel:
+        # The UNet weights of a bundled SD copy: only the layout is needed (SD21_UNET).
+        if '/unet/' in low and not low.endswith('.json'):
             continue
-        # The UNet weights of a bundled SD copy: only its config is needed.
-        if '/unet/' in rel and not rel.endswith('.json'):
-            continue
-        os.makedirs(os.path.dirname(f.local_path), exist_ok=True)
+        dest = os.path.join(zoo, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
         print('downloading', rel, flush=True)
-        gdown.download(id=f.id, output=f.local_path, quiet=True)
-        print('  ', os.path.getsize(f.local_path) // 1024 // 1024, 'MB', flush=True)
+        gdown.download(id=fid, output=dest, quiet=True)
+        print('  ', os.path.getsize(dest) // 1024 // 1024, 'MB', flush=True)
 
 
 def find(zoo, team, suffixes):
@@ -113,6 +144,7 @@ def run(repo, zoo, inputs, out):
     import torch
     torch.set_grad_enabled(False)
     torch.set_num_threads(os.cpu_count() or 4)
+    os.makedirs(out, exist_ok=True)
     times = []
     for name, build, multiple in (('antman', antman, 1), ('samsung', samsung, 16)):
         try:
