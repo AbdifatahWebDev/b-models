@@ -1,0 +1,68 @@
+name: CodeFormer
+
+# Adds CodeFormer (face restore with a likeness control) to release models-v3: converted from the
+# official weights by tools/codeformer/convert.py, checked against PyTorch on three of CodeFormer's
+# sample faces, then models.json is updated. Started by hand only.
+#
+# CodeFormer is licensed for non-commercial use only (S-Lab License 1.0): LICENSE-CodeFormer.txt
+# is uploaded with the model, and the app offers it only in personal builds.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: models-v3
+      WEIGHTS_URL: https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth
+      WEIGHTS_SHA256: 1009e537e0c2a07d4cabce6355f53cb66767cd4b4297ec7a4a64ca4b8a5684b7
+      FACES_URL: https://raw.githubusercontent.com/sczhou/CodeFormer/master/inputs/cropped_faces
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # The versions the conversion was checked with.
+          pip install numpy pillow ncnn==1.0.20260526 pnnx==20250530
+
+      - name: Fetch inputs
+        run: |
+          mkdir -p work/faces dist
+          curl -sSfL -o work/codeformer.pth "$WEIGHTS_URL"
+          echo "$WEIGHTS_SHA256  work/codeformer.pth" | sha256sum -c -
+          for f in 0143 0368 0444; do curl -sSfL -o "work/faces/$f.png" "$FACES_URL/$f.png"; done
+          gh release download "$TAG" --dir work --pattern 'models.json'
+
+      - name: Convert and check
+        run: python3 tools/codeformer/convert.py --weights work/codeformer.pth --out dist --check work/faces
+
+      - name: Add to models.json
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          m = json.load(open("work/models.json"))
+          # The face detector is shared with GFPGAN: same files, same entries.
+          gfpgan = next(x for x in m["models"] if x["id"] == "gfpgan")
+          detector = [f for f in gfpgan["files"] if f["name"].startswith("retinaface-mnet.")]
+          files = []
+          for name in ("codeformer.param", "codeformer.bin"):
+              p = os.path.join("dist", name)
+              files.append({"name": name, "size": os.path.getsize(p), "sha256": hashlib.sha256(open(p, "rb").read()).hexdigest()})
+          m["models"] = [x for x in m["models"] if x["id"] != "codeformer"] + [{"id": "codeformer", "files": files + detector}]
+          with open("dist/models.json", "w", newline="\n") as f:
+              f.write(json.dumps(m, indent=2) + "\n")
+          print([x["id"] for x in m["models"]])
+          PY
+
+      - name: Upload to the release
+        run: gh release upload "$TAG" dist/codeformer.param dist/codeformer.bin dist/LICENSE-CodeFormer.txt dist/models.json --clobber
