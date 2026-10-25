@@ -292,7 +292,9 @@ def main():
     print('wrote', ', '.join(sorted(os.listdir(a.out))))
     if a.check:
         worst = check(weights, a.out, a.check)
-        # fp16 weights: a mean error of a few thousandths on [-1, 1] is under one 8-bit level.
+        # fp16 weights: a mean error of a few thousandths on [-1, 1] is under one 8-bit level
+        # (0.002-0.009 on the six sample faces; the rare larger pixels are codebook choices that
+        # flipped between near-equal codes).
         if worst > 0.01:
             raise SystemExit(f'ncnn output differs from PyTorch (mean error {worst:.3g})')
         print('check passed')
