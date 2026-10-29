@@ -1,0 +1,128 @@
+name: Max model (TSD-SR)
+
+# Builds Brekwol Upscale's experimental Max model: TSD-SR (one-step diffusion on Stable Diffusion
+# 3 Medium, 2B) converted to ncnn by tools/tsdsr/convert.py, checked against PyTorch and against
+# the authors' own script.
+#
+# SD3 Medium's licence (Stability AI Non-Commercial Research Community) doesn't allow public
+# redistribution, so nothing is published here: the files go straight to release max-model of the
+# private repository AbdifatahWebDev/brekwol-upscaler (only the check results are kept here).
+# Needs two repository secrets: HF_TOKEN (a Hugging Face read token of an account that accepted
+# the SD3 Medium licence) and UPSCALER_TOKEN (a GitHub fine-grained token with Contents: read and
+# write on brekwol-upscaler). Started by hand only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GH_TOKEN: ${{ secrets.UPSCALER_TOKEN }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      DEST: AbdifatahWebDev/brekwol-upscaler
+      TAG: max-model
+    steps:
+      - name: Free disk (the SD3 weights and the model need about 20 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          path: bm
+
+      - name: Tokens present
+        run: |
+          [ -n "$HF_TOKEN" ] || { echo "No HF_TOKEN secret"; exit 1; }
+          [ -n "$GH_TOKEN" ] || { echo "No UPSCALER_TOKEN secret"; exit 1; }
+          gh release list -R "$DEST" --limit 1 > /dev/null || { echo "UPSCALER_TOKEN can't read $DEST"; exit 1; }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install (TSD-SR's pinned versions, CPU)
+        run: |
+          pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cpu
+          pip install diffusers==0.29.1 transformers==4.49.0 huggingface_hub==0.26.5 peft==0.15.0 numpy==1.24.4 \
+            accelerate safetensors pillow sentencepiece einops tqdm "gdown==6.4.2" beautifulsoup4 requests \
+            ncnn==1.0.20260526 pnnx==20250530
+          mkdir -p results dist
+
+      - name: Weights
+        run: |
+          if [ -z "$HF_TOKEN" ]; then echo "No HF_TOKEN secret in this repository"; exit 1; fi
+          python3 bm/tools/max/fetch_tsdsr.py tsdw
+          python3 - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+          snapshot_download("stabilityai/stable-diffusion-3-medium-diffusers", local_dir="sd3", token=os.environ["HF_TOKEN"],
+                            allow_patterns=["model_index.json", "transformer/*", "vae/*"])
+          PY
+          du -sh sd3/* tsdw/*
+
+      - name: Test tiles (128 px from public sample photos)
+        run: |
+          git clone -q --depth 1 https://github.com/TencentARC/GFPGAN gfpgan
+          git clone -q --depth 1 https://github.com/cswry/VOSR vosr
+          mkdir -p tiles
+          python3 - <<'PY'
+          import glob, os
+          from PIL import Image
+          paths = sorted(glob.glob("gfpgan/inputs/whole_imgs/*")) + sorted(glob.glob("vosr/preset/datasets/inp_data/*"))
+          for p in paths:
+              im = Image.open(p).convert("RGB")
+              f = 240 / max(im.size)
+              if "inp_data" not in p and f < 1:
+                  im = im.resize((round(im.width * f), round(im.height * f)), Image.LANCZOS)
+              w, h = im.size
+              if min(w, h) < 128:
+                  continue
+              # The upper middle: where the faces are in portraits.
+              x0, y0 = (w - 128) // 2, max(0, min(h - 128, h // 4 - 64))
+              im.crop((x0, y0, x0 + 128, y0 + 128)).save("tiles/" + os.path.splitext(os.path.basename(p))[0] + ".png")
+          print(sorted(os.listdir("tiles")))
+          PY
+
+      - name: The authors' script on the tiles (reference)
+        run: |
+          set -o pipefail
+          git clone -q --depth 1 https://github.com/Microtreei/TSD-SR tsdsr
+          cd tsdsr
+          python3 test/test_tsdsr.py --pretrained_model_name_or_path ../sd3 -i ../tiles -o ../official \
+            --lora_dir ../tsdw/tsdsr --embedding_dir ../tsdw/default --device cpu --mixed_precision fp32 \
+            --align_method nofix 2>&1 | grep -v Warning | tee ../results/log-official.txt
+
+      - name: Convert and check
+        run: |
+          set -o pipefail
+          python3 bm/tools/tsdsr/convert.py --sd3 sd3 --lora tsdw/tsdsr --embeds tsdw/default --out dist \
+            --check tiles 2>&1 | grep -v -i warn | tee results/log-convert.txt
+          python3 bm/tools/tsdsr/vs_official.py official dist/ncnn-tiles 2>&1 | tee results/vs-official.txt
+          cp dist/check-tsdsr.* results/
+          ls -la dist
+
+      - name: Publish to the private repo
+        run: |
+          cd dist
+          # GitHub release files must be under 2 GB: the .bin goes in parts, joined again by the app.
+          split -b 1900m -d -a 1 tsdsr-x4.bin tsdsr-x4.bin.part
+          rm tsdsr-x4.bin
+          sha256sum tsdsr-x4.param tsdsr-x4.bin.part* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cd ..
+          gh release view "$TAG" -R "$DEST" > /dev/null 2>&1 || gh release create "$TAG" -R "$DEST" --prerelease --title "Max model (TSD-SR, personal use)" \
+            --notes "TSD-SR on Stable Diffusion 3 Medium, converted for Brekwol Upscale's Max mode. Personal, non-commercial use only (Stability AI Non-Commercial Research Community License). Download every file on the phone, then Models > Import model file."
+          gh release upload "$TAG" -R "$DEST" dist/tsdsr-x4.param dist/tsdsr-x4.bin.part* dist/SHA256SUMS.txt results/* --clobber
+
+      - name: Results even when a step failed (logs and check only, no weights)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view max-test > /dev/null 2>&1 || gh release create max-test --prerelease --title "Max quality test files" --notes "Comparison files. Not used by the app."
+          for f in results/*; do gh release upload max-test "$f" --clobber || true; done
