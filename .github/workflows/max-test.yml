@@ -32,7 +32,7 @@ jobs:
         run: |
           pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cpu
           pip install diffusers==0.29.1 transformers==4.49.0 huggingface_hub==0.26.5 peft==0.15.0 numpy==1.24.4 \
-            accelerate pillow sentencepiece "gdown==6.4.2" beautifulsoup4 requests ncnn
+            accelerate pillow sentencepiece einops tqdm "gdown==6.4.2" beautifulsoup4 requests ncnn
           mkdir -p results
 
       - name: Weights (TSD-SR from its authors' Drive, SD3 Medium from Hugging Face)
