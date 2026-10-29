@@ -1,0 +1,100 @@
+name: Max quality test
+
+# Is a bigger generative model worth an experimental "Max" mode? Runs on small public photos:
+# AdcSR as the app runs it, SCUNet clean-up then AdcSR, and TSD-SR (CVPR 2025: one step on
+# Stable Diffusion 3 Medium, about 2B parameters, by its own code on the CPU). Posts side-by-side
+# sheets, times and logs to release max-test. Test only. Started by hand only.
+#
+# SD3 Medium is gated on Hugging Face: it needs the repository secret HF_TOKEN, a read token of
+# an account that accepted the model's licence.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      TAG: max-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install (TSD-SR's pinned versions, CPU)
+        run: |
+          pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cpu
+          pip install diffusers==0.29.1 transformers==4.49.0 huggingface_hub==0.26.5 peft==0.15.0 numpy==1.24.4 \
+            accelerate pillow sentencepiece "gdown==6.4.2" beautifulsoup4 requests ncnn
+          mkdir -p results
+
+      - name: Weights (TSD-SR from its authors' Drive, SD3 Medium from Hugging Face)
+        run: |
+          set -o pipefail
+          {
+            git clone -q --depth 1 https://github.com/Microtreei/TSD-SR tsdsr
+            python3 tools/max/fetch_tsdsr.py tsdw
+            if [ -z "$HF_TOKEN" ]; then echo "No HF_TOKEN secret: SD3 Medium can't be downloaded"; exit 1; fi
+            python3 - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+          snapshot_download("stabilityai/stable-diffusion-3-medium-diffusers", local_dir="sd3", token=os.environ["HF_TOKEN"],
+                            allow_patterns=["model_index.json", "transformer/*", "vae/*"])
+          PY
+            du -sh sd3/* tsdw/*
+          } 2>&1 | tee results/log-weights.txt
+
+      - name: Test photos (public samples, shrunk to 240 px like a small phone photo)
+        run: |
+          git clone -q --depth 1 https://github.com/TencentARC/GFPGAN gfpgan
+          git clone -q --depth 1 https://github.com/cswry/VOSR vosr
+          mkdir -p inputs
+          python3 - <<'PY'
+          import glob, os
+          from PIL import Image
+          paths = sorted(glob.glob("gfpgan/inputs/whole_imgs/*")) + sorted(glob.glob("vosr/preset/datasets/inp_data/*"))
+          for p in paths:
+              im = Image.open(p).convert("RGB")
+              stem = os.path.splitext(os.path.basename(p))[0]
+              if "inp_data" in p:
+                  w, h = im.size
+                  im = im.crop(((w - 240) // 2, (h - 240) // 2, (w + 240) // 2, (h + 240) // 2))
+              else:
+                  f = 240 / max(im.size)
+                  if f < 1:
+                      im = im.resize((round(im.width * f), round(im.height * f)), Image.LANCZOS)
+              im = im.crop((0, 0, im.width // 8 * 8, im.height // 8 * 8))
+              im.save(f"inputs/{stem}.png")
+              print(stem, im.size)
+          PY
+
+      - name: TSD-SR (CPU, fp32)
+        run: |
+          set -o pipefail
+          cd tsdsr
+          start=$(date +%s)
+          python3 test/test_tsdsr.py --pretrained_model_name_or_path ../sd3 -i ../inputs -o ../tsd_out \
+            --lora_dir ../tsdw/tsdsr --embedding_dir ../tsdw/default --device cpu --mixed_precision fp32 2>&1 \
+            | tee ../results/log-tsdsr.txt
+          echo "TSD-SR total $(( $(date +%s) - start )) s for $(ls ../inputs | wc -l) photos, includes loading" | tee ../results/tsdsr-time.txt
+
+      - name: Sheets with the app's models
+        if: always()
+        run: |
+          set -o pipefail
+          mkdir -p models tsd_out
+          gh release download models-v3 --dir models --pattern 'adcsr-x4.*' --pattern 'scunet-color.*'
+          python3 tools/max/compare_max.py inputs models tsd_out results 2>&1 | tee results/log-sheets.txt
+
+      - name: Publish
+        if: always()
+        run: |
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --prerelease --title "Max quality test files" --notes "Comparison files. Not used by the app."
+          gh release upload "$TAG" results/* --clobber
