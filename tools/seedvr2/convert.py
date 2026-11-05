@@ -451,15 +451,26 @@ class Block(nn.Module):
 
     def forward(self, h, c):
         n = h.shape[1]
+        if self.last:
+            # The last block modulates only the image tokens (its AdaSingle is vid_only): the text
+            # tokens enter its attention normalised but unscaled, and nothing after it reads them.
+            b = self.all if self.shared else self.vid
+            bt = self.all if self.shared else self.txt
+            xv = rms(h) * b.attn_scale + b.attn_shift
+            if self.shared:
+                qkv = b.qkv(torch.cat([xv, rms(c)], dim=1))
+                qv, qt = qkv[:, :n], qkv[:, n:]
+            else:
+                qv, qt = b.qkv(xv), bt.qkv(rms(c))
+            av, _ = self.attention(qv, qt, b, bt)
+            h = h + b.out(av) * b.attn_gate
+            return h + b.mlp(rms(h) * b.mlp_scale + b.mlp_shift) * b.mlp_gate, None
         if self.shared:
             b = self.all
             x = torch.cat([h, c], dim=1)
             qkv = b.qkv(rms(x) * b.attn_scale + b.attn_shift)
             av, at = self.attention(qkv[:, :n], qkv[:, n:], b, b)
             x = x + b.out(torch.cat([av, at], dim=1)) * b.attn_gate
-            if self.last:
-                h = x[:, :n]
-                return h + b.mlp(rms(h) * b.mlp_scale + b.mlp_shift) * b.mlp_gate, None
             x = x + b.mlp(rms(x) * b.mlp_scale + b.mlp_shift) * b.mlp_gate
             return x[:, :n], x[:, n:]
         bv, bt = self.vid, self.txt
@@ -469,8 +480,6 @@ class Block(nn.Module):
         h = h + bv.out(av) * bv.attn_gate
         c = c + bt.out(at) * bt.attn_gate
         h = h + bv.mlp(rms(h) * bv.mlp_scale + bv.mlp_shift) * bv.mlp_gate
-        if self.last:
-            return h, None
         c = c + bt.mlp(rms(c) * bt.mlp_scale + bt.mlp_shift) * bt.mlp_gate
         return h, c
 
