@@ -5,15 +5,27 @@ name: Ultra quality test (SeedVR2-3B)
 # (the phone can only hold it in 8 bits)? Runs all three on the same 128 px tiles, the size of
 # one Max tile on the phone, by their own code on the CPU, and posts side-by-side sheets, times
 # and peak memory to release ultra-test. Test only, nothing here is used by the app.
-# Started by hand only.
+# Started by hand only. "models: seedvr2-8bit" with "reuse_run" (the id of an earlier run) runs
+# only the 8-bit model and takes the other columns from that run's outputs.
 #
 # TSD-SR needs SD3 Medium, which is gated on Hugging Face: the repository secret HF_TOKEN (a read
 # token of an account that accepted its licence). SeedVR2 needs no token.
 on:
   workflow_dispatch:
+    inputs:
+      models:
+        description: Models to run
+        type: choice
+        options: [all, seedvr2-8bit]
+        default: all
+      reuse_run:
+        description: Id of an earlier run whose outputs fill the columns not run now (optional)
+        required: false
+        default: ""
 
 permissions:
   contents: write
+  actions: read
 
 env:
   # Community CLI for SeedVR2 that runs without CUDA (the official code needs flash-attn and a GPU).
@@ -23,6 +35,7 @@ env:
 jobs:
   tsdsr:
     name: TSD-SR (Max now)
+    if: inputs.models == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -90,15 +103,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - variant: fp16
-            dit: seedvr2_ema_3b_fp16.safetensors
-            repo: numz/SeedVR2_comfyUI
-          - variant: 8bit
-            dit: seedvr2_ema_3b-Q8_0.gguf
-            repo: AInVFX/SeedVR2_comfyUI
+        variant: ${{ fromJSON(inputs.models == 'all' && '["fp16","8bit"]' || '["8bit"]') }}
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      DIT: ${{ matrix.variant == 'fp16' && 'seedvr2_ema_3b_fp16.safetensors' || 'seedvr2_ema_3b-Q8_0.gguf' }}
+      DIT_REPO: ${{ matrix.variant == 'fp16' && 'numz/SeedVR2_comfyUI' || 'AInVFX/SeedVR2_comfyUI' }}
     steps:
       - name: Free disk and add swap (the model is 7 GB in fp16; the runner has 16 GB of memory)
         run: |
@@ -136,9 +145,6 @@ jobs:
           python3 bm/tools/ultra/make_tiles.py tiles gfpgan/inputs/whole_imgs resr/inputs vosr/preset/datasets/inp_data
 
       - name: Weights (Hugging Face)
-        env:
-          DIT: ${{ matrix.dit }}
-          DIT_REPO: ${{ matrix.repo }}
         run: |
           set -o pipefail
           python3 - <<'PY' 2>&1 | tee results/log-seedvr2-${{ matrix.variant }}-weights.txt
@@ -150,12 +156,25 @@ jobs:
               print(name, os.path.getsize(p) // 2**20, "MB")
           PY
 
+      # The CLI computes in bf16. On a runner without AVX-512 that falls back to a very slow path
+      # (the first 8-bit run sat in the first VAE encode for 4 hours on such a runner, the fp16 run
+      # took a minute a tile), so there it computes in fp32 instead. The CPU and precision used
+      # are kept with the results.
       - name: SeedVR2-3B ${{ matrix.variant }} (CPU, x4 to 512 px)
+        timeout-minutes: 100
         run: |
           set -o pipefail
+          cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)
+          if grep -qw avx512f /proc/cpuinfo; then prec=bf16; else
+            prec=fp32
+            sed -i 's/^COMPUTE_DTYPE = .*/COMPUTE_DTYPE = torch.float32/' cli/src/optimization/compatibility.py
+            grep -q '^COMPUTE_DTYPE = torch.float32' cli/src/optimization/compatibility.py
+          fi
+          echo "SeedVR2-3B ${{ matrix.variant }}: $cpu, $(nproc) threads, computing in $prec" \
+            | tee results/seedvr2-${{ matrix.variant }}-cpu.txt
           cd cli
           /usr/bin/time -v -o ../results/seedvr2-${{ matrix.variant }}-time.txt python3 inference_cli.py ../tiles \
-            --output ../out --output_format png --model_dir ../models --dit_model "${{ matrix.dit }}" \
+            --output ../out --output_format png --model_dir ../models --dit_model "$DIT" \
             --resolution 512 --batch_size 1 --seed 42 --cache_dit --cache_vae --debug 2>&1 \
             | tee ../results/log-seedvr2-${{ matrix.variant }}.txt
           ls -la ../out
@@ -183,6 +202,14 @@ jobs:
         with:
           path: bm
 
+      - name: Outputs of the earlier run
+        if: inputs.reuse_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: art
+          run-id: ${{ inputs.reuse_run }}
+          github-token: ${{ github.token }}
+
       - name: Outputs of the model jobs
         uses: actions/download-artifact@v4
         with:
@@ -202,10 +229,13 @@ jobs:
           # Time and peak memory of each model run, and every log.
           for d in art/*; do cp "$d"/results/* results/ 2>/dev/null || true; done
           for f in results/*-time.txt; do
-            echo "== $f"; grep -E "Elapsed \(wall|Maximum resident" "$f"
+            echo "== $f"
+            grep -E "Elapsed \(wall|Maximum resident" "$f" || echo "  no result (the run did not finish)"
           done 2>&1 | tee results/summary.txt
+          cat results/*-cpu.txt 2>/dev/null | tee -a results/summary.txt || true
 
       - name: Publish
+        if: always()
         run: |
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --prerelease \
             --title "Ultra quality test files" --notes "SeedVR2-3B (fp16 and 8-bit) next to TSD-SR on 128 px tiles. Comparison files. Not used by the app."
