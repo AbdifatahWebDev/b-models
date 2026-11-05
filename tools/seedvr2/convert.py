@@ -401,7 +401,7 @@ class Block(nn.Module):
             ada = ada_consts(w, p, 'all', emb, dim, ['attn', 'mlp'])
             self.all = Branch(w, p, 'all', ada, perm, self.heads, False)
         else:
-            self.vid = Branch(w, p, 'vid', ada_consts(w, p, 'vid', emb, dim, ['attn', 'mlp']), perm, self.heads, self.last)
+            self.vid = Branch(w, p, 'vid', ada_consts(w, p, 'vid', emb, dim, ['attn', 'mlp']), perm, self.heads, False)
             self.txt = Branch(w, p, 'txt', ada_consts(w, p, 'txt', emb, dim, ['attn', 'mlp']), perm, self.heads, self.last)
         hs, ws = windows(GRID, shifted=shifted)
         self.hs, self.ws = hs, ws
@@ -622,11 +622,10 @@ def piece_outputs(name, out, state):
 # ---------------------------------------------------------------------------------------------
 # Tiny random model (same layout and names as the real files, small sizes)
 
-def tiny_weights():
+def tiny_weights(dim=64, heads=2, hd=32, L=4, mm=2, hid=256):
     g = torch.Generator().manual_seed(0)
     rnd = lambda *s, k=0.3: torch.randn(*s, generator=g) * k
-    dim, heads, hd, L, mm, txt_in, z = 64, 2, 32, 4, 2, 48, 16
-    hid = 256
+    txt_in, z = 48, 16
     w = {
         'vid_in.proj.weight': rnd(dim, (2 * z + 1) * 4, k=0.1), 'vid_in.proj.bias': rnd(dim),
         'txt_in.weight': rnd(dim, txt_in, k=0.1), 'txt_in.bias': rnd(dim),
@@ -814,7 +813,9 @@ def ncnn_piece(param, binf, ins, n_out):
     net.load_param(param)
     net.load_model(binf)
     arrs = [np.ascontiguousarray(t[0].numpy() if t.shape[0] == 1 and t.ndim in (3, 4) else t.numpy()) for t in ins]
-    mats = [ncnn.Mat(a) for a in arrs]
+    # Own copies: a layer that works in place on an input borrowing numpy's memory crashes ncnn
+    # (seen with RMSNorm straight on in1 in ncnn 20261020).
+    mats = [ncnn.Mat(a).clone() for a in arrs]
     ex = net.create_extractor()
     for i, m in enumerate(mats):
         ex.input(f'in{i}', m)
