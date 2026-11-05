@@ -1,0 +1,212 @@
+name: Ultra quality test (SeedVR2-3B)
+
+# Is SeedVR2-3B (ByteDance, ICLR 2026: one-step restoration on a 3B diffusion transformer,
+# Apache 2.0) clearly better than TSD-SR, the app's Max model, and does it stay good in 8 bits
+# (the phone can only hold it in 8 bits)? Runs all three on the same 128 px tiles, the size of
+# one Max tile on the phone, by their own code on the CPU, and posts side-by-side sheets, times
+# and peak memory to release ultra-test. Test only, nothing here is used by the app.
+# Started by hand only.
+#
+# TSD-SR needs SD3 Medium, which is gated on Hugging Face: the repository secret HF_TOKEN (a read
+# token of an account that accepted its licence). SeedVR2 needs no token.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Community CLI for SeedVR2 that runs without CUDA (the official code needs flash-attn and a GPU).
+  SEEDVR2_CLI: https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler
+  SEEDVR2_CLI_COMMIT: 4490bd1f482e026674543386bb2a4d176da245b9
+
+jobs:
+  tsdsr:
+    name: TSD-SR (Max now)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install (TSD-SR's pinned versions, CPU)
+        run: |
+          pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cpu
+          pip install diffusers==0.29.1 transformers==4.49.0 huggingface_hub==0.26.5 peft==0.15.0 numpy==1.24.4 \
+            accelerate pillow sentencepiece einops tqdm "gdown==6.4.2" beautifulsoup4 requests
+          [ -x /usr/bin/time ] || sudo apt-get install -y -qq time
+          mkdir -p results out
+
+      - name: Test tiles
+        run: |
+          git clone -q --depth 1 https://github.com/TencentARC/GFPGAN gfpgan
+          git clone -q --depth 1 https://github.com/xinntao/Real-ESRGAN resr
+          git clone -q --depth 1 https://github.com/cswry/VOSR vosr
+          python3 bm/tools/ultra/make_tiles.py tiles gfpgan/inputs/whole_imgs resr/inputs vosr/preset/datasets/inp_data
+
+      - name: Weights (TSD-SR from its authors' Drive, SD3 Medium from Hugging Face)
+        run: |
+          set -o pipefail
+          {
+            [ -n "$HF_TOKEN" ] || { echo "No HF_TOKEN secret: SD3 Medium can't be downloaded"; exit 1; }
+            python3 bm/tools/max/fetch_tsdsr.py tsdw
+            python3 - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+          snapshot_download("stabilityai/stable-diffusion-3-medium-diffusers", local_dir="sd3", token=os.environ["HF_TOKEN"],
+                            allow_patterns=["model_index.json", "transformer/*", "vae/*"])
+          PY
+          } 2>&1 | tee results/log-tsdsr-weights.txt
+
+      - name: TSD-SR (CPU, fp32)
+        run: |
+          set -o pipefail
+          git clone -q --depth 1 https://github.com/Microtreei/TSD-SR tsdsr
+          cd tsdsr
+          /usr/bin/time -v -o ../results/tsdsr-time.txt python3 test/test_tsdsr.py --pretrained_model_name_or_path ../sd3 \
+            -i ../tiles -o ../out --lora_dir ../tsdw/tsdsr --embedding_dir ../tsdw/default --device cpu \
+            --mixed_precision fp32 2>&1 | grep -v Warning | tee ../results/log-tsdsr.txt
+
+      - name: Keep outputs and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsdsr
+          path: |
+            out
+            results
+
+  seedvr2:
+    name: SeedVR2-3B ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: fp16
+            dit: seedvr2_ema_3b_fp16.safetensors
+            repo: numz/SeedVR2_comfyUI
+          - variant: 8bit
+            dit: seedvr2_ema_3b-Q8_0.gguf
+            repo: AInVFX/SeedVR2_comfyUI
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - name: Free disk and add swap (the model is 7 GB in fp16; the runner has 16 GB of memory)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 16G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+          free -g
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          path: bm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install (CPU)
+        run: |
+          pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install diffusers==0.35.1 peft==0.17.1 transformers==4.56.2 rotary_embedding_torch==0.8.9 omegaconf==2.3.0 \
+            safetensors einops tqdm psutil opencv-python-headless==4.10.0.84 gguf==0.17.1 matplotlib huggingface_hub pillow
+          git init -q cli
+          git -C cli fetch -q --depth 1 "$SEEDVR2_CLI" "$SEEDVR2_CLI_COMMIT"
+          git -C cli checkout -q FETCH_HEAD
+          [ -x /usr/bin/time ] || sudo apt-get install -y -qq time
+          mkdir -p results out models
+
+      - name: Test tiles
+        run: |
+          git clone -q --depth 1 https://github.com/TencentARC/GFPGAN gfpgan
+          git clone -q --depth 1 https://github.com/xinntao/Real-ESRGAN resr
+          git clone -q --depth 1 https://github.com/cswry/VOSR vosr
+          python3 bm/tools/ultra/make_tiles.py tiles gfpgan/inputs/whole_imgs resr/inputs vosr/preset/datasets/inp_data
+
+      - name: Weights (Hugging Face)
+        env:
+          DIT: ${{ matrix.dit }}
+          DIT_REPO: ${{ matrix.repo }}
+        run: |
+          set -o pipefail
+          python3 - <<'PY' 2>&1 | tee results/log-seedvr2-${{ matrix.variant }}-weights.txt
+          import os
+          from huggingface_hub import hf_hub_download
+          tok = os.environ.get("HF_TOKEN") or None
+          for repo, name in ((os.environ["DIT_REPO"], os.environ["DIT"]), ("numz/SeedVR2_comfyUI", "ema_vae_fp16.safetensors")):
+              p = hf_hub_download(repo, name, local_dir="models", token=tok)
+              print(name, os.path.getsize(p) // 2**20, "MB")
+          PY
+
+      - name: SeedVR2-3B ${{ matrix.variant }} (CPU, x4 to 512 px)
+        run: |
+          set -o pipefail
+          cd cli
+          /usr/bin/time -v -o ../results/seedvr2-${{ matrix.variant }}-time.txt python3 inference_cli.py ../tiles \
+            --output ../out --output_format png --model_dir ../models --dit_model "${{ matrix.dit }}" \
+            --resolution 512 --batch_size 1 --seed 42 --cache_dit --cache_vae --debug 2>&1 \
+            | tee ../results/log-seedvr2-${{ matrix.variant }}.txt
+          ls -la ../out
+
+      - name: Keep outputs and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seedvr2-${{ matrix.variant }}
+          path: |
+            out
+            results
+
+  sheets:
+    name: Sheets
+    needs: [tsdsr, seedvr2]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ultra-test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bm
+
+      - name: Outputs of the model jobs
+        uses: actions/download-artifact@v4
+        with:
+          path: art
+
+      - name: Sheets
+        run: |
+          set -o pipefail
+          pip install pillow numpy
+          git clone -q --depth 1 https://github.com/TencentARC/GFPGAN gfpgan
+          git clone -q --depth 1 https://github.com/xinntao/Real-ESRGAN resr
+          git clone -q --depth 1 https://github.com/cswry/VOSR vosr
+          python3 bm/tools/ultra/make_tiles.py tiles gfpgan/inputs/whole_imgs resr/inputs vosr/preset/datasets/inp_data
+          mkdir -p results
+          python3 bm/tools/ultra/sheets.py tiles results "TSD-SR (Max now)=art/tsdsr/out" \
+            "SeedVR2-3B=art/seedvr2-fp16/out" "SeedVR2-3B 8-bit=art/seedvr2-8bit/out" 2>&1 | tee results/log-sheets.txt
+          # Time and peak memory of each model run, and every log.
+          for d in art/*; do cp "$d"/results/* results/ 2>/dev/null || true; done
+          for f in results/*-time.txt; do
+            echo "== $f"; grep -E "Elapsed \(wall|Maximum resident" "$f"
+          done 2>&1 | tee results/summary.txt
+
+      - name: Publish
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --prerelease \
+            --title "Ultra quality test files" --notes "SeedVR2-3B (fp16 and 8-bit) next to TSD-SR on 128 px tiles. Comparison files. Not used by the app."
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" results/* --clobber
