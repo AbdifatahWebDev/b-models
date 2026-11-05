@@ -22,9 +22,14 @@ on:
         type: choice
         options: ["64", "32", "128"]
         default: "64"
+      reference_run:
+        description: Id of an earlier run whose reference to reuse (skips the tiny and reference jobs)
+        required: false
+        default: ""
 
 permissions:
   contents: write
+  actions: read
 
 env:
   SEEDVR2_CLI: https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler
@@ -34,6 +39,7 @@ env:
 jobs:
   tiny:
     name: Rewrite check (small random model)
+    if: inputs.reference_run == ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -148,6 +154,7 @@ jobs:
   convert:
     name: Convert, check, publish
     needs: reference
+    if: always() && (needs.reference.result == 'success' || inputs.reference_run != '')
     runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
@@ -203,16 +210,26 @@ jobs:
           python3 bm/tools/ultra/make_tiles.py tiles gfpgan/inputs/whole_imgs resr/inputs vosr/preset/datasets/inp_data
 
       - name: The reference
+        if: inputs.reference_run == ''
         uses: actions/download-artifact@v4
         with:
           name: reference
           path: refart
 
+      - name: The reference (earlier run)
+        if: inputs.reference_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: reference
+          path: refart
+          run-id: ${{ inputs.reference_run }}
+          github-token: ${{ github.token }}
+
       - name: Convert and check
         run: |
           set -o pipefail
           mkdir -p results dist
-          /usr/bin/time -v -o results/convert-time.txt python3 bm/tools/seedvr2/convert.py \
+          /usr/bin/time -v -o results/convert-time.txt python3 -X faulthandler bm/tools/seedvr2/convert.py \
             --dit models/seedvr2_ema_3b_fp16.safetensors --vae models/ema_vae_fp16.safetensors --pos-emb seedvr/pos_emb.pt \
             --out dist --check tiles --ref refart/ref --bits "${{ inputs.bits }}" --block "${{ inputs.block }}" \
             --quantizer ncnn-build/tools/quantize/ncnnllm2int 2>&1 | grep -v -i "warn\|^quantize_\|^\s*$" | tee results/log-convert.txt

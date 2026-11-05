@@ -828,6 +828,34 @@ def ncnn_piece(param, binf, ins, n_out):
     return outs
 
 
+def ncnn_pieces(param, binf, ins_list, n_out, work):
+    """ncnn_piece for many tiles in a child process (a crash or leak in ncnn can't take the
+    converter with it, and the piece's memory is surely given back)."""
+    src = os.path.join(work, 'ncnn-in.npz')
+    dst = os.path.join(work, 'ncnn-out.npz')
+    np.savez(src, **{f't{t}_{i}': x.numpy() for t, ins in enumerate(ins_list) for i, x in enumerate(ins)},
+             counts=np.array([len(ins) for ins in ins_list]))
+    r = subprocess.run([sys.executable, '-X', 'faulthandler', os.path.abspath(__file__), '--ncnn-worker',
+                        param, binf, src, dst, str(n_out)], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stdout[-3000:], r.stderr[-6000:])
+        raise SystemExit(f'ncnn run of {os.path.basename(param)} failed (exit {r.returncode})')
+    out = np.load(dst)
+    res = [[torch.from_numpy(out[f't{t}_{i}']) for i in range(n_out)] for t in range(len(ins_list))]
+    os.remove(src), os.remove(dst)
+    return res
+
+
+def ncnn_worker(param, binf, src, dst, n_out):
+    data = np.load(src)
+    outs = {}
+    for t, cnt in enumerate(data['counts']):
+        ins = [torch.from_numpy(data[f't{t}_{i}']) for i in range(int(cnt))]
+        for i, o in enumerate(ncnn_piece(param, binf, ins, int(n_out))):
+            outs[f't{t}_{i}'] = o.numpy()
+    np.savez(dst, **outs)
+
+
 def sha256(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -883,9 +911,9 @@ def run(model, tile_list, noise, out_dir, args):
             line += f'; {os.path.getsize(dst_b) / 2**20:.0f} MB'
             if args.check:
                 errs = []
-                for tn, x in tile_list:
-                    ins = piece_inputs(name, st_nc[tn], x, noise)
-                    outs = ncnn_piece(dst_p, dst_b, ins, entry['outputs'])
+                all_ins = [piece_inputs(name, st_nc[tn], x, noise) for tn, x in tile_list]
+                all_outs = ncnn_pieces(dst_p, dst_b, all_ins, entry['outputs'], work)
+                for (tn, x), outs in zip(tile_list, all_outs):
                     out = tuple(outs) if len(outs) > 1 else outs[0]
                     piece_outputs(name, out, st_nc[tn])
                     ref = st_pt[tn]['out'] if name == 'decode' else st_pt[tn]['h']
@@ -943,6 +971,9 @@ def save_sheet(tile_list, st_pt, st_nc, ref_dir, out_dir):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == '--ncnn-worker':
+        ncnn_worker(*sys.argv[2:7])
+        return
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dit')
     ap.add_argument('--vae')
