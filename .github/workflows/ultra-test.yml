@@ -170,6 +170,15 @@ jobs:
             sed -i 's/^COMPUTE_DTYPE = .*/COMPUTE_DTYPE = torch.float32/' cli/src/optimization/compatibility.py
             grep -q '^COMPUTE_DTYPE = torch.float32' cli/src/optimization/compatibility.py
           fi
+          if [ "${{ matrix.variant }}" = 8bit ]; then
+            # The GGUF file keeps its unquantized layers in fp16. The CLI converts them to the
+            # compute precision only on Apple GPUs (CUDA's autocast covers it), so on the CPU they
+            # met fp32 inputs and the first layer failed. Convert them on the CPU too; the
+            # quantized weights are left packed (that function skips them).
+            sed -i "s/if not skip_conversion and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():/if not skip_conversion:/" \
+              cli/src/optimization/compatibility.py
+            grep -q '^        if not skip_conversion:$' cli/src/optimization/compatibility.py
+          fi
           echo "SeedVR2-3B ${{ matrix.variant }}: $cpu, $(nproc) threads, computing in $prec" \
             | tee results/seedvr2-${{ matrix.variant }}-cpu.txt
           cd cli
