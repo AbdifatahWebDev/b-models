@@ -226,6 +226,12 @@ jobs:
             --notes "SeedVR2-3B (ByteDance, Apache-2.0) converted to ncnn pieces for Brekwol Upscale's Ultra mode by tools/seedvr2/convert.py; the DiT in ${{ inputs.bits }}-bit blocks of ${{ inputs.block }}. ultra.json lists the pieces with sizes and SHA-256. check-ultra.* compares the conversion with the original model."
           gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/ultra-*.param dist/ultra-*.bin dist/ultra.json LICENSE-SeedVR.txt --clobber
           for f in results/*; do gh release upload "$TAG" -R "$GITHUB_REPOSITORY" "$f" --clobber; done
+          # List the pieces in the app's models.json (models-v3), pointing at this release.
+          mkdir -p manifest
+          gh release download models-v3 -R "$GITHUB_REPOSITORY" --pattern models.json --dir manifest --clobber
+          python3 bm/tools/seedvr2/add_to_manifest.py manifest/models.json dist/ultra.json \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          gh release upload models-v3 -R "$GITHUB_REPOSITORY" manifest/models.json --clobber
 
       - name: Logs even when a step failed
         if: failure()

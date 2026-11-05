@@ -1,7 +1,8 @@
 name: Models v3
 
 # Publishes release models-v3: everything in models-v2 plus the AdcSR generative upscaler from
-# the adcsr-test release (built by the AdcSR test workflow). Started by hand only.
+# the adcsr-test release (built by the AdcSR test workflow). Its models.json also lists Ultra,
+# whose files stay in release ultra-model (Ultra model workflow). Started by hand only.
 on:
   workflow_dispatch:
 
@@ -26,6 +27,11 @@ jobs:
           cp tools/adcsr/LICENSE-AdcSR dist/LICENSE-AdcSR.txt
           rm -f dist/models.json
           python3 tools/make-manifest.py dist -o dist/models.json
+          # Ultra's pieces stay in their own release (ultra-model); models.json points at them.
+          if gh release download ultra-model --pattern ultra.json --dir ultra --clobber; then
+            python3 tools/seedvr2/add_to_manifest.py dist/models.json ultra/ultra.json \
+              "https://github.com/$GITHUB_REPOSITORY/releases/download/ultra-model"
+          fi
           ls -la dist
 
       - name: Publish the release
