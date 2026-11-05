@@ -1,0 +1,234 @@
+name: Ultra model (SeedVR2-3B)
+
+# Builds Brekwol Upscale's experimental Ultra model: SeedVR2-3B (ByteDance, Apache-2.0, one-step
+# restoration on a 3B diffusion transformer) converted to ncnn pieces by tools/seedvr2/convert.py.
+#   tiny       the conversion on a small random model, checked against the community code's own
+#              modules (reference.py --tiny): catches a wrong rewrite in minutes, before the
+#              big jobs run.
+#   reference  the real model in the community code, fp32, on eight 128 px tiles.
+#   convert    the rewrite on the same tiles (must match the reference), ncnn export, 8-bit block
+#              quantization of the DiT pieces, ncnn vs PyTorch; then release ultra-model.
+# Weights need no token. Started by hand only.
+on:
+  workflow_dispatch:
+    inputs:
+      bits:
+        description: DiT weight bits (8 = dynamic int8; 6 = weight-only, smaller)
+        type: choice
+        options: ["8", "6"]
+        default: "8"
+      block:
+        description: Quantization block size
+        type: choice
+        options: ["64", "32", "128"]
+        default: "64"
+
+permissions:
+  contents: write
+
+env:
+  SEEDVR2_CLI: https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler
+  SEEDVR2_CLI_COMMIT: 4490bd1f482e026674543386bb2a4d176da245b9
+  NCNN_TAG: "20261020"
+
+jobs:
+  tiny:
+    name: Rewrite check (small random model)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install diffusers==0.35.1 peft==0.17.1 transformers==4.56.2 rotary_embedding_torch==0.8.9 omegaconf==2.3.0 \
+            safetensors einops tqdm psutil opencv-python-headless==4.10.0.84 gguf==0.17.1 matplotlib pillow numpy
+          git init -q cli
+          git -C cli fetch -q --depth 1 "$SEEDVR2_CLI" "$SEEDVR2_CLI_COMMIT"
+          git -C cli checkout -q FETCH_HEAD
+
+      - name: Test tiles
+        run: |
+          git clone -q --depth 1 https://github.com/TencentARC/GFPGAN gfpgan
+          git clone -q --depth 1 https://github.com/xinntao/Real-ESRGAN resr
+          git clone -q --depth 1 https://github.com/cswry/VOSR vosr
+          python3 bm/tools/ultra/make_tiles.py tiles gfpgan/inputs/whole_imgs resr/inputs vosr/preset/datasets/inp_data
+
+      - name: Small model, the original code, the rewrite
+        run: |
+          set -o pipefail
+          mkdir -p results
+          {
+            python3 bm/tools/seedvr2/convert.py --tiny --out tiny --check tiles --tiles 3 --save-tiny tinyw --no-export
+            python3 bm/tools/seedvr2/reference.py --numz cli --dit tinyw/dit.safetensors --vae tinyw/vae.safetensors \
+              --pos-emb tinyw/pos_emb.pt --tiles tiles --count 3 --out tinyref --tiny
+            python3 bm/tools/seedvr2/convert.py --tiny --out tiny --check tiles --tiles 3 --ref tinyref --no-export
+          } 2>&1 | grep -v -i warn | tee results/log-tiny.txt
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny
+          path: results
+
+  reference:
+    name: Original model on the tiles (fp32)
+    needs: tiny
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free disk and add swap (the 3B model is 13 GB in fp32; the runner has 16 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 16G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+          free -g
+
+      - uses: actions/checkout@v4
+        with:
+          path: bm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install diffusers==0.35.1 peft==0.17.1 transformers==4.56.2 rotary_embedding_torch==0.8.9 omegaconf==2.3.0 \
+            safetensors einops tqdm psutil opencv-python-headless==4.10.0.84 gguf==0.17.1 matplotlib pillow numpy huggingface_hub
+          git init -q cli
+          git -C cli fetch -q --depth 1 "$SEEDVR2_CLI" "$SEEDVR2_CLI_COMMIT"
+          git -C cli checkout -q FETCH_HEAD
+          [ -x /usr/bin/time ] || sudo apt-get install -y -qq time
+
+      - name: Weights
+        run: |
+          python3 - <<'PY'
+          from huggingface_hub import hf_hub_download
+          for name in ("seedvr2_ema_3b_fp16.safetensors", "ema_vae_fp16.safetensors"):
+              hf_hub_download("numz/SeedVR2_comfyUI", name, local_dir="models")
+          PY
+          git clone -q --depth 1 https://github.com/ByteDance-Seed/SeedVR seedvr
+          ls -la models seedvr/pos_emb.pt
+
+      - name: Test tiles
+        run: |
+          git clone -q --depth 1 https://github.com/TencentARC/GFPGAN gfpgan
+          git clone -q --depth 1 https://github.com/xinntao/Real-ESRGAN resr
+          git clone -q --depth 1 https://github.com/cswry/VOSR vosr
+          python3 bm/tools/ultra/make_tiles.py tiles gfpgan/inputs/whole_imgs resr/inputs vosr/preset/datasets/inp_data
+
+      - name: Reference
+        run: |
+          set -o pipefail
+          mkdir -p results
+          /usr/bin/time -v -o results/reference-time.txt python3 bm/tools/seedvr2/reference.py --numz cli \
+            --dit models/seedvr2_ema_3b_fp16.safetensors --vae models/ema_vae_fp16.safetensors --pos-emb seedvr/pos_emb.pt \
+            --tiles tiles --out ref 2>&1 | grep -v -i warn | tee results/log-reference.txt
+
+      - name: Keep the reference
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference
+          path: |
+            ref
+            results
+
+  convert:
+    name: Convert, check, publish
+    needs: reference
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ultra-model
+    steps:
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          path: bm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install diffusers==0.35.1 safetensors einops pillow numpy huggingface_hub \
+            "ncnn==1.0.$NCNN_TAG" "pnnx==$NCNN_TAG"
+          [ -x /usr/bin/time ] || sudo apt-get install -y -qq time
+
+      - name: ncnn block quantizer (ncnnllm2int, ncnn ${{ env.NCNN_TAG }})
+        run: |
+          git clone -q --depth 1 --branch "$NCNN_TAG" https://github.com/Tencent/ncnn ncnn-src
+          cmake -S ncnn-src -B ncnn-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNCNN_VULKAN=OFF -DNCNN_BUILD_TOOLS=ON \
+            -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_BENCHMARK=OFF -DNCNN_BUILD_TESTS=OFF -DNCNN_SIMPLEOCV=ON -DNCNN_PYTHON=OFF > /dev/null
+          cmake --build ncnn-build --target ncnnllm2int -j "$(nproc)" > /dev/null
+          ls -la ncnn-build/tools/quantize/ncnnllm2int
+
+      - name: Weights
+        run: |
+          python3 - <<'PY'
+          from huggingface_hub import hf_hub_download
+          for name in ("seedvr2_ema_3b_fp16.safetensors", "ema_vae_fp16.safetensors"):
+              hf_hub_download("numz/SeedVR2_comfyUI", name, local_dir="models")
+          PY
+          git clone -q --depth 1 https://github.com/ByteDance-Seed/SeedVR seedvr
+          cp seedvr/LICENSE LICENSE-SeedVR.txt
+
+      - name: Test tiles
+        run: |
+          git clone -q --depth 1 https://github.com/TencentARC/GFPGAN gfpgan
+          git clone -q --depth 1 https://github.com/xinntao/Real-ESRGAN resr
+          git clone -q --depth 1 https://github.com/cswry/VOSR vosr
+          python3 bm/tools/ultra/make_tiles.py tiles gfpgan/inputs/whole_imgs resr/inputs vosr/preset/datasets/inp_data
+
+      - name: The reference
+        uses: actions/download-artifact@v4
+        with:
+          name: reference
+          path: refart
+
+      - name: Convert and check
+        run: |
+          set -o pipefail
+          mkdir -p results dist
+          /usr/bin/time -v -o results/convert-time.txt python3 bm/tools/seedvr2/convert.py \
+            --dit models/seedvr2_ema_3b_fp16.safetensors --vae models/ema_vae_fp16.safetensors --pos-emb seedvr/pos_emb.pt \
+            --out dist --check tiles --ref refart/ref --bits "${{ inputs.bits }}" --block "${{ inputs.block }}" \
+            --quantizer ncnn-build/tools/quantize/ncnnllm2int 2>&1 | grep -v -i "warn\|^quantize_\|^\s*$" | tee results/log-convert.txt
+          cp dist/check-ultra.* dist/ultra.json results/
+          ls -la dist
+
+      - name: Publish
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --prerelease \
+            --title "Ultra model (SeedVR2-3B, experimental)" \
+            --notes "SeedVR2-3B (ByteDance, Apache-2.0) converted to ncnn pieces for Brekwol Upscale's Ultra mode by tools/seedvr2/convert.py; the DiT in ${{ inputs.bits }}-bit blocks of ${{ inputs.block }}. ultra.json lists the pieces with sizes and SHA-256. check-ultra.* compares the conversion with the original model."
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/ultra-*.param dist/ultra-*.bin dist/ultra.json LICENSE-SeedVR.txt --clobber
+          for f in results/*; do gh release upload "$TAG" -R "$GITHUB_REPOSITORY" "$f" --clobber; done
+
+      - name: Logs even when a step failed
+        if: failure()
+        run: |
+          gh release view ultra-test -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 || gh release create ultra-test -R "$GITHUB_REPOSITORY" --prerelease --title "Ultra quality test files" --notes "Comparison files. Not used by the app."
+          for f in results/*; do gh release upload ultra-test -R "$GITHUB_REPOSITORY" "$f" --clobber || true; done
