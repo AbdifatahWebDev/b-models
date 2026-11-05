@@ -43,7 +43,8 @@ def load_into(module, path):
             with torch.no_grad():
                 own[k].copy_(t.float())
             loaded.add(k)
-    missing = [k for k in own if k not in loaded and 'freqs' not in k and 'cached' not in k]
+    params = dict(module.named_parameters())
+    missing = [k for k in params if k not in loaded]         # buffers (rope tables) are computed
     print(f'{os.path.basename(path)}: {len(loaded)} tensors; missing {missing[:8]}{"..." if len(missing) > 8 else ""}; '
           f'unexpected {unexpected[:8]}', flush=True)
     if missing:
