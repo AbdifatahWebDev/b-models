@@ -1,0 +1,115 @@
+name: Create model (SANA-Sprint 0.6B)
+
+# Builds Brekwol Upscale's Create model: SANA-Sprint 0.6B (NVIDIA; Gemma-2-2B text encoder)
+# converted to ncnn pieces by tools/create/sana_export.py: the Gemma vocabulary and int8 embedding
+# rows, the text encoder in pieces of two layers with the instruction prefix cached (block-quantized
+# by ncnn's ncnnllm2int), the transformer and the DC-AE decoder. The check runs the pieces through
+# tools/create/sana_ncnn.py (what the app does) against PyTorch's own pipeline: text embeddings and
+# a whole image. Then three sample pictures from the pieces, and release create-model.
+# Started by hand only.
+on:
+  workflow_dispatch:
+    inputs:
+      bits:
+        description: Text encoder weight bits
+        type: choice
+        options: ["8", "6", "4"]
+        default: "8"
+      block:
+        description: Quantization block size
+        type: choice
+        options: ["64", "32", "128"]
+        default: "64"
+      quantize_dit:
+        description: Quantize the transformer too (smaller download)
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  NCNN_TAG: "20261020"
+  REPO: Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers
+  GEMMA_TOKENIZER: https://raw.githubusercontent.com/google/gemma_pytorch/main/tokenizer/tokenizer.model
+  GEMMA_TOKENIZER_SHA256: 61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2
+  HF_HOME: /mnt/hf
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bm
+
+      - name: Disk and swap
+        run: bash bm/tools/create/runner-setup.sh 24
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install torch==2.15.0 torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install diffusers==0.42.1 transformers==5.22.2 accelerate==1.15.0 safetensors sentencepiece protobuf \
+            pillow numpy "ncnn==1.0.$NCNN_TAG" "pnnx==$NCNN_TAG"
+
+      - name: ncnn block quantizer (ncnnllm2int, ncnn ${{ env.NCNN_TAG }})
+        run: |
+          git clone -q --depth 1 --branch "$NCNN_TAG" https://github.com/Tencent/ncnn ncnn-src
+          cmake -S ncnn-src -B ncnn-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNCNN_VULKAN=OFF -DNCNN_BUILD_TOOLS=ON \
+            -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_BENCHMARK=OFF -DNCNN_BUILD_TESTS=OFF -DNCNN_SIMPLEOCV=ON -DNCNN_PYTHON=OFF > /dev/null
+          cmake --build ncnn-build --target ncnnllm2int -j "$(nproc)" > /dev/null
+          ls -la ncnn-build/tools/quantize/ncnnllm2int
+
+      - name: Gemma tokenizer (SentencePiece model, for the app's vocabulary)
+        run: |
+          curl -fL --retry 3 -o tokenizer.model "$GEMMA_TOKENIZER"
+          echo "$GEMMA_TOKENIZER_SHA256  tokenizer.model" | sha256sum -c
+
+      - name: Convert and check against PyTorch
+        timeout-minutes: 240
+        run: |
+          set -o pipefail
+          mkdir -p results
+          QDIT=""
+          [ "${{ inputs.quantize_dit }}" = "true" ] && QDIT="--quantize-dit"
+          cd bm/tools/create
+          /usr/bin/time -v -o ../../../results/time-convert.txt python3 sana_export.py --repo "$REPO" \
+            --vocab-model ../../../tokenizer.model --out ../../../dist --check \
+            --quantizer ../../../ncnn-build/tools/quantize/ncnnllm2int --bits "${{ inputs.bits }}" --block "${{ inputs.block }}" $QDIT \
+            2>&1 | grep -v -i "warn\|^quantize_\|^\s*$\|^ \|pnnx\|=\|#\|│\|─\|┌\|└\|├" | tee ../../../results/log-convert.txt
+
+      - name: Sample pictures from the pieces
+        if: always()
+        run: |
+          cd bm/tools/create
+          for p in "fox|A red fox sitting in fresh snow in a forest, sharp focus on the eyes" \
+                   "cafe|A cozy coffee shop interior with a chalkboard menu, warm lights, plants" \
+                   "portrait|Portrait of a young African woman with braided hair smiling, natural window light"; do
+            /usr/bin/time -f "${p%%|*}: %e s, %M KB" python3 sana_ncnn.py ../../../dist "${p#*|}" "../../../results/sample-${p%%|*}.png" \
+              --vocab ../../../tokenizer.model 2>&1 | tail -1 | tee -a ../../../results/log-samples.txt
+          done
+          cp ../../../dist/check-create.png ../../../results/ 2>/dev/null || true
+          rm -f ../../../dist/check-create.png
+
+      - name: Publish
+        if: success()
+        run: |
+          cd dist && sha256sum * | tee ../results/sha256.txt && cd ..
+          ls -la dist results
+          gh release create create-model -R "$GITHUB_REPOSITORY" dist/* results/* --title "Create model (SANA-Sprint 0.6B)" \
+            --notes "SANA-Sprint 0.6B (NVIDIA, Apache-2.0) with its Gemma-2-2B text encoder (Gemma terms of use), converted to ncnn pieces for Brekwol Upscale's Create screen by tools/create/sana_export.py. Text encoder in ${{ inputs.bits }}-bit blocks of ${{ inputs.block }}. check-create.png: PyTorch (left) and the pieces (right) from the same noise; log-convert.txt has the numbers."
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: create-model-logs
+          path: results
