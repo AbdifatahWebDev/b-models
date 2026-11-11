@@ -1,0 +1,50 @@
+name: Face swap model
+
+# Builds release swap-model: the face swap models for Brekwol Upscale's Swap screen (0.8),
+# converted to ncnn by tools/swap/convert.py and checked against the original ONNX models.
+# The originals come from FaceFusion's model assets, pinned by SHA-256. Started by hand only.
+# This repository is public, so its Actions minutes are free.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: swap-model
+      ASSETS: https://github.com/facefusion/facefusion-assets/releases/download
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install converters
+        run: pip install numpy==2.5.4 onnx==1.23.2 onnxruntime==1.31.1 pnnx==20261020 ncnn==1.0.20261020
+
+      - name: Download the original models
+        run: |
+          mkdir -p weights
+          curl -fL --retry 3 -o weights/arcface_w600k_r50.onnx "$ASSETS/models-3.0.0/arcface_w600k_r50.onnx"
+          curl -fL --retry 3 -o weights/hyperswap_1a_256.onnx "$ASSETS/models-3.3.0/hyperswap_1a_256.onnx"
+          sha256sum -c <<'EOF'
+          f1f79dc3b0b79a69f94799af1fffebff09fbd78fd96a275fd8f0cbbea23270d1  weights/arcface_w600k_r50.onnx
+          c0e98a8a03a238f461ed3d2570e426b49f46745ee400854a60dceeb70c246add  weights/hyperswap_1a_256.onnx
+          EOF
+
+      - name: Convert to ncnn and check against onnxruntime
+        run: |
+          python tools/swap/convert.py --check --out dist \
+            --arcface weights/arcface_w600k_r50.onnx --hyperswap weights/hyperswap_1a_256.onnx 2>&1 | grep -v "^ "
+          sha256sum dist/*
+
+      - name: Publish the release
+        run: |
+          cp tools/swap/RELEASE.md dist/README.md
+          gh release create "$TAG" dist/* --title "Face swap model" --notes-file tools/swap/RELEASE.md
