@@ -317,6 +317,24 @@ def instruction():
 
 # ---------------------------------------------------------------- main
 
+def write_meta(out, part, values):
+    with open(os.path.join(out, f'meta-{part}.json'), 'w') as f:
+        json.dump(values, f, indent=1)
+
+
+def merge_meta(out):
+    """create.json from meta-text.json and meta-image.json, once both exist."""
+    parts = [os.path.join(out, f'meta-{p}.json') for p in ('text', 'image')]
+    if not all(os.path.exists(p) for p in parts):
+        return
+    meta = {'version': 1}
+    for p in parts:
+        meta.update(json.load(open(p)))
+        os.remove(p)
+    with open(os.path.join(out, 'create.json'), 'w') as f:
+        json.dump(meta, f, indent=1)
+    print('wrote create.json')
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--repo')
@@ -330,136 +348,143 @@ def main():
     ap.add_argument('--block', type=int, default=64)
     ap.add_argument('--quantize-dit', action='store_true')
     ap.add_argument('--check', action='store_true')
+    ap.add_argument('--stage', choices=['text', 'image', 'all'], default='all')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     work = tempfile.mkdtemp()
     torch.set_grad_enabled(False)
 
     parts = Parts(a)
-    tok = parts.get('tokenizer')
-    te = parts.get('text_encoder')
-    cfg = te.config
-    chi = '\n'.join(instruction())
+    # --stage text / image: one part per run (the workflow runs them as separate jobs, each on a
+    # fresh runner); both leave meta-*.json, merged into create.json once both are there.
+    if a.stage in ('text', 'all'):
+        tok = parts.get('tokenizer')
+        te = parts.get('text_encoder')
+        cfg = te.config
+        chi = '\n'.join(instruction())
 
-    # Tokenizer: the app's vocabulary, and the instruction ids HF's tokenizer gives.
-    import gemma_vocab
-    sys.argv = ['gemma_vocab.py', a.vocab_model, os.path.join(a.out, 'gemma-vocab.bin')]
-    gemma_vocab.main()
-    chi_ids = tok(chi, add_special_tokens=True).input_ids
-    prefix = len(chi_ids) - 2  # the last instruction tokens may join the prompt's first word
-    print(f'instruction: {len(chi_ids)} tokens, {prefix} cached')
+        # Tokenizer: the app's vocabulary, and the instruction ids HF's tokenizer gives.
+        import gemma_vocab
+        sys.argv = ['gemma_vocab.py', a.vocab_model, os.path.join(a.out, 'gemma-vocab.bin')]
+        gemma_vocab.main()
+        chi_ids = tok(chi, add_special_tokens=True).input_ids
+        prefix = len(chi_ids) - 2  # the last instruction tokens may join the prompt's first word
+        print(f'instruction: {len(chi_ids)} tokens, {prefix} cached')
 
-    # Embedding rows (int8) and the cached prefix.
-    emb_scale, emb_q = write_embed(te.embed_tokens.weight, os.path.join(a.out, 'gemma-embed.bin'))
-    if not a.random:
-        te.embed_tokens = None  # 1.2 GB that nothing needs any more (the tiny check still uses it)
-    normalizer = float(cfg.hidden_size) ** 0.5
+        # Embedding rows (int8) and the cached prefix.
+        emb_scale, emb_q = write_embed(te.embed_tokens.weight, os.path.join(a.out, 'gemma-embed.bin'))
+        if not a.random:
+            te.embed_tokens = None  # 1.2 GB that nothing needs any more (the tiny check still uses it)
+        normalizer = float(cfg.hidden_size) ** 0.5
 
-    def embed(ids):
-        return torch.from_numpy(emb_q[ids].astype(np.float32) * emb_scale[ids, None] * np.float32(normalizer)).unsqueeze(0)
+        def embed(ids):
+            return torch.from_numpy(emb_q[ids].astype(np.float32) * emb_scale[ids, None] * np.float32(normalizer)).unsqueeze(0)
 
-    x0 = embed(chi_ids[:prefix])
-    h_prefix, kv = run_layers(te, x0, 0, collect=True)
-    np.asarray(h_prefix[0, 0], dtype='<f4').tofile(os.path.join(a.out, 'text-h0.bin'))
+        x0 = embed(chi_ids[:prefix])
+        h_prefix, kv = run_layers(te, x0, 0, collect=True)
+        np.asarray(h_prefix[0, 0], dtype='<f4').tofile(os.path.join(a.out, 'text-h0.bin'))
 
-    # Text pieces.
-    layers = len(te.layers)
-    pieces = []
-    n = a.text_tokens  # fixed: ncnn's dynamic shapes broke at untraced lengths; the app pads
-    for first in range(0, layers, a.layers_per_piece):
-        last = min(layers, first + a.layers_per_piece)
-        m = GemmaLayers(te, first, last, kv, final=last == layers)
-        stem = os.path.join(a.out, f'text-{len(pieces):02d}')
+        # Text pieces.
+        layers = len(te.layers)
+        pieces = []
+        n = a.text_tokens  # fixed: ncnn's dynamic shapes broke at untraced lengths; the app pads
+        for first in range(0, layers, a.layers_per_piece):
+            last = min(layers, first + a.layers_per_piece)
+            m = GemmaLayers(te, first, last, kv, final=last == layers)
+            stem = os.path.join(a.out, f'text-{len(pieces):02d}')
 
-        def sample(n):
-            cos, sin = rope(cfg, range(prefix, prefix + n))
-            return (torch.zeros(1, n, cfg.hidden_size), cos.unsqueeze(0), sin.unsqueeze(0),
-                    causal_mask(n, prefix).unsqueeze(0))
-        # --random: fp32 weights, so the check tests the graph (tiny random weights amplify fp16
-        # rounding far beyond what a trained model does); the real run checks fp16 / quantized.
-        pnnx_export(m, sample(n), None, stem, work, fp16=not a.random)
-        if a.quantizer:
-            quantize(stem, a.quantizer, a.bits, a.block)
-        pieces.append(os.path.basename(stem))
-        print('exported', pieces[-1], f'layers {first}..{last - 1}')
+            def sample(n):
+                cos, sin = rope(cfg, range(prefix, prefix + n))
+                return (torch.zeros(1, n, cfg.hidden_size), cos.unsqueeze(0), sin.unsqueeze(0),
+                        causal_mask(n, prefix).unsqueeze(0))
+            # --random: fp32 weights, so the check tests the graph (tiny random weights amplify fp16
+            # rounding far beyond what a trained model does); the real run checks fp16 / quantized.
+            pnnx_export(m, sample(n), None, stem, work, fp16=not a.random)
+            if a.quantizer:
+                quantize(stem, a.quantizer, a.bits, a.block)
+            pieces.append(os.path.basename(stem))
+            print('exported', pieces[-1], f'layers {first}..{last - 1}')
 
-    m = None  # the last piece holds layers of te
-    del te, kv, h_prefix, emb_q
-    drop()
-    tr = parts.get('transformer')
+        m = None  # the last piece holds layers of te
+        del te, kv, h_prefix, emb_q
+        drop()
+        write_meta(a.out, 'text', {
+            'instruction': chi,
+            'prefix_ids': chi_ids[:prefix],
+            'instruction_tokens': len(chi_ids),
+            'text_tokens': a.text_tokens,
+            'max_prompt_tokens': a.text_tokens - (len(chi_ids) - prefix),
+            'hidden': cfg.hidden_size,
+            'head_dim': cfg.head_dim,
+            'rope_theta': getattr(cfg, 'rope_theta', None) or cfg.rope_parameters['rope_theta'],
+            'normalizer': normalizer,
+            'mask_neg': MASK_NEG,
+            'text_pieces': pieces,
+        })
 
-    # Transformer: (latent, scm timestep, guidance, text) -> model output.
-    class Dit(nn.Module):
-        # The model's own unpatchify goes through a 6-D reshape, which ncnn has not; with patch
-        # size 1 it is a transpose, done here on proj_out's output (the rest is traced away).
-        def __init__(self, t):
-            super().__init__()
-            assert t.config.patch_size == 1
-            self.t = t
-            self.last = None
-            t.proj_out.register_forward_hook(lambda mod, inp, out: setattr(self, 'last', out))
+    if a.stage in ('image', 'all'):
+        tr = parts.get('transformer')
 
-        def forward(self, x, t, g, text):
-            self.t(x, encoder_hidden_states=text, timestep=t, guidance=g, return_dict=False)
-            return self.last.transpose(1, 2).reshape(1, -1, x.shape[2], x.shape[3])  # [1, H*W, C] -> [1, C, H, W]
+        # Transformer: (latent, scm timestep, guidance, text) -> model output.
+        class Dit(nn.Module):
+            # The model's own unpatchify goes through a 6-D reshape, which ncnn has not; with patch
+            # size 1 it is a transpose, done here on proj_out's output (the rest is traced away).
+            def __init__(self, t):
+                super().__init__()
+                assert t.config.patch_size == 1
+                self.t = t
+                self.last = None
+                t.proj_out.register_forward_hook(lambda mod, inp, out: setattr(self, 'last', out))
 
-    lc = tr.config.in_channels
-    side = tr.config.sample_size
-    dit_in = (torch.randn(1, lc, side, side), torch.tensor([0.5]), torch.tensor([4.5]),
-              torch.randn(1, 20, cfg.hidden_size))
-    dit_in2 = (torch.randn(1, lc, side, side), torch.tensor([0.5]), torch.tensor([4.5]),
-               torch.randn(1, 40, cfg.hidden_size))
-    pnnx_export(Dit(tr), dit_in, dit_in2, os.path.join(a.out, 'sana-dit'), work)
-    if a.quantizer and a.quantize_dit:
-        quantize(os.path.join(a.out, 'sana-dit'), a.quantizer, a.bits, a.block)
-    print('exported sana-dit')
+            def forward(self, x, t, g, text):
+                self.t(x, encoder_hidden_states=text, timestep=t, guidance=g, return_dict=False)
+                return self.last.transpose(1, 2).reshape(1, -1, x.shape[2], x.shape[3])  # [1, H*W, C] -> [1, C, H, W]
 
-    guidance = 4.5 * tr.config.guidance_embeds_scale
-    del tr
-    drop()
-    vae = parts.get('vae')
+        lc = tr.config.in_channels
+        side = tr.config.sample_size
+        dit_in = (torch.randn(1, lc, side, side), torch.tensor([0.5]), torch.tensor([4.5]),
+                  torch.randn(1, 20, tr.config.caption_channels))
+        dit_in2 = (torch.randn(1, lc, side, side), torch.tensor([0.5]), torch.tensor([4.5]),
+                   torch.randn(1, 40, tr.config.caption_channels))
+        pnnx_export(Dit(tr), dit_in, dit_in2, os.path.join(a.out, 'sana-dit'), work)
+        if a.quantizer and a.quantize_dit:
+            quantize(os.path.join(a.out, 'sana-dit'), a.quantizer, a.bits, a.block)
+        print('exported sana-dit')
 
-    class Vae(nn.Module):
-        def __init__(self, v):
-            super().__init__()
-            self.v = v
+        guidance = 4.5 * tr.config.guidance_embeds_scale
+        del tr
+        drop()
+        vae = parts.get('vae')
 
-        def forward(self, z):
-            return self.v.decode(z, return_dict=False)[0]
+        class Vae(nn.Module):
+            def __init__(self, v):
+                super().__init__()
+                self.v = v
 
-    pnnx_export(Vae(vae), (torch.randn(1, lc, side, side),), None, os.path.join(a.out, 'sana-vae'), work)
-    print('exported sana-vae')
+            def forward(self, z):
+                return self.v.decode(z, return_dict=False)[0]
 
-    vae_scale = 2 ** (len(vae.config.decoder_block_out_channels) - 1)
-    scaling = vae.config.scaling_factor
-    del vae
-    drop()
-    sch = parts.get('scheduler').config
-    meta = {
-        'version': 1,
-        'instruction': chi,
-        'prefix_ids': chi_ids[:prefix],
-        'instruction_tokens': len(chi_ids),
-        'text_tokens': a.text_tokens,
-        'max_prompt_tokens': a.text_tokens - (len(chi_ids) - prefix),
-        'hidden': cfg.hidden_size,
-        'head_dim': cfg.head_dim,
-        'rope_theta': getattr(cfg, 'rope_theta', None) or cfg.rope_parameters['rope_theta'],
-        'normalizer': normalizer,
-        'mask_neg': MASK_NEG,
-        'text_pieces': pieces,
-        'latent_channels': lc,
-        'latent_side': side,
-        'vae_scale': vae_scale,
-        'scaling_factor': scaling,
-        'sigma_data': sch.sigma_data,
-        'timesteps': [1.57080, 1.3, 0.0],
-        'guidance': guidance,
-    }
-    with open(os.path.join(a.out, 'create.json'), 'w') as f:
-        json.dump(meta, f, indent=1)
+        pnnx_export(Vae(vae), (torch.randn(1, lc, side, side),), None, os.path.join(a.out, 'sana-vae'), work)
+        print('exported sana-vae')
 
-    if a.check:
+        vae_scale = 2 ** (len(vae.config.decoder_block_out_channels) - 1)
+        scaling = vae.config.scaling_factor
+        del vae
+        drop()
+        sch = parts.get('scheduler').config
+        write_meta(a.out, 'image', {
+            'latent_channels': lc,
+            'latent_side': side,
+            'vae_scale': vae_scale,
+            'scaling_factor': scaling,
+            'sigma_data': sch.sigma_data,
+            'timesteps': [1.57080, 1.3, 0.0],
+            'guidance': guidance,
+        })
+
+    merge_meta(a.out)
+
+    if a.check and os.path.exists(os.path.join(a.out, 'create.json')):
         # The real model's check runs in its own process (sana_ncnn.py --check), with nothing
         # else in memory; the tiny random one right here.
         import sana_ncnn
