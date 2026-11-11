@@ -5,8 +5,8 @@ name: Create model (SANA-Sprint 0.6B)
 # more than one model (one runner holding the whole pipeline lost contact three times):
 #   text   the Gemma vocabulary, int8 embedding rows and the text encoder in pieces of two layers
 #          with the instruction prefix cached, block-quantized by ncnn's ncnnllm2int;
-#   image  the transformer and the DC-AE decoder (pnnx needs ~29 GB on the 1024 px decoder:
-#          48 GB of swap);
+#   image  the transformer and the DC-AE decoder (traced at 256 and 512 px, since pnnx needed
+#          ~29 GB at 1024 px, and checked in ncnn at 1024 px);
 #   check  the pieces through tools/create/sana_ncnn.py (what the app does) against PyTorch, text
 #          embeddings and a whole image, then three sample pictures, and release create-model.
 # Every job prints memory and disk use each minute. Started by hand only.

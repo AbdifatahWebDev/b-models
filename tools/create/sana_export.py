@@ -180,8 +180,13 @@ def _repeat_as_concat(self, repeats, dim=None, output_size=None):
     assert isinstance(repeats, int) and dim is not None
     shape = list(self.shape)
     d = dim % len(shape)
-    y = torch.stack([self] * repeats, dim=d + 1)
-    return y.reshape(shape[:d] + [shape[d] * repeats] + shape[d + 1:])
+    # Each slice along [d] repeated in place, through 4-D tensors only: [1, C, H, W] (dim 1) goes
+    # [1, C, 1, H*W], [1, C, r, H*W], [1, C*r, H, W]. A 5-D stack or unsqueeze came out of pnnx
+    # as a reshape that ncnn either lacks or runs wrong at an untraced size.
+    assert len(shape) == 4 and d == 1, 'only the channel repeat of DC-AE'
+    y = self.reshape(shape[0], shape[1], 1, shape[2] * shape[3])
+    y = torch.cat([y] * repeats, dim=2)
+    return y.reshape(shape[0], shape[1] * repeats, shape[2], shape[3])
 
 
 def pnnx_export(module, inputs, inputs2, stem, work, fp16=True):
@@ -215,6 +220,40 @@ def pnnx_export(module, inputs, inputs2, stem, work, fp16=True):
         if f.startswith(name):
             p = os.path.join(work, f)
             (shutil.rmtree if os.path.isdir(p) else os.remove)(p)
+
+
+def vae_trace_sides(side):
+    """The two latent sides the decoder is traced at: smaller than [side], so ncnn runs it at a size
+    it was not traced at (checked by export_vae)."""
+    small = max(side // 4, 4)
+    return small, max(side // 2, small + 2)
+
+
+def export_vae(module, channels, side, stem, work):
+    """Exports the decoder traced at small sizes and checks it in ncnn at the full [side]."""
+    small, mid = vae_trace_sides(side)
+    pnnx_export(module, (torch.randn(1, channels, small, small),), (torch.randn(1, channels, mid, mid),), stem, work)
+    import ncnn
+    torch.manual_seed(1)
+    z = torch.randn(1, channels, side, side)
+    want = module(z)[0].numpy()
+    net = ncnn.Net()
+    net.opt.use_vulkan_compute = False
+    net.opt.num_threads = int(os.environ.get('OMP_NUM_THREADS', '4'))
+    net.load_param(stem + '.param')
+    net.load_model(stem + '.bin')
+    ex = net.create_extractor()
+    zn = np.ascontiguousarray(z[0].numpy())  # ncnn.Mat shares this memory: keep it alive
+    ex.input('in0', ncnn.Mat(zn))
+    _, out = ex.extract('out0')
+    got = np.array(out)
+    del ex, net, zn
+    assert got.shape == want.shape, (got.shape, want.shape)
+    mse = float(np.mean((np.clip(got, -1, 1) - np.clip(want, -1, 1)) ** 2))
+    psnr = 10 * np.log10(4 / max(mse, 1e-12))  # pixels in [-1, 1]: peak-to-peak 2
+    print(f'sana-vae at {side}x{side} (traced at {small} and {mid}): PSNR {psnr:.1f} dB against PyTorch')
+    if psnr < 30:
+        raise SystemExit('sana-vae does not match PyTorch at the full size')
 
 
 def quantize(stem, tool, bits, block):
@@ -464,7 +503,10 @@ def main():
             def forward(self, z):
                 return self.v.decode(z, return_dict=False)[0]
 
-        pnnx_export(Vae(vae), (torch.randn(1, lc, side, side),), None, os.path.join(a.out, 'sana-vae'), work)
+        # pnnx keeps every activation while it converts: at the full latent (1024 px) that took more
+        # than 29 GB. The decoder is convolutions and attention over any size, so it is traced at a
+        # quarter and a half of the side (two sizes make the shapes dynamic) and checked at full size.
+        export_vae(Vae(vae), lc, side, os.path.join(a.out, 'sana-vae'), work)
         print('exported sana-vae')
 
         vae_scale = 2 ** (len(vae.config.decoder_block_out_channels) - 1)

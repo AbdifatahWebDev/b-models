@@ -37,8 +37,10 @@ class Pieces:
 
     def run(self, net, inputs):
         ex = net.create_extractor()
-        for name, a in zip(net.input_names(), inputs):
-            ex.input(name, self.ncnn.Mat(np.ascontiguousarray(a, dtype=np.float32)))
+        # ncnn.Mat(array) shares the array's memory: keep the arrays alive until the extraction.
+        keep = [np.ascontiguousarray(a, dtype=np.float32) for a in inputs]
+        for name, a in zip(net.input_names(), keep):
+            ex.input(name, self.ncnn.Mat(a))
         r, m = ex.extract(sorted(net.output_names())[0])
         assert r == 0
         return np.array(m)
