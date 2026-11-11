@@ -241,12 +241,32 @@ def write_embed(weight, path):
 
 # ---------------------------------------------------------------- models
 
-def load(args):
-    if args.random:
-        return random_models(args.vocab_model)
-    from diffusers import SanaSprintPipeline
-    pipe = SanaSprintPipeline.from_pretrained(args.repo, dtype=torch.float32)
-    return pipe
+class Parts:
+    """The pipeline's parts, loaded one at a time (in fp32 the whole pipeline is ~13 GB, which
+    stopped the 16 GB GitHub runner): drop() each one once it is exported."""
+
+    def __init__(self, args):
+        self.repo = args.repo
+        self.pipe = random_models(args.vocab_model) if args.random else None
+
+    def get(self, name):
+        if self.pipe is not None:
+            return getattr(self.pipe, name)
+        from diffusers import AutoencoderDC, SanaTransformer2DModel, SCMScheduler
+        from transformers import AutoTokenizer, Gemma2Model
+        kind = {'tokenizer': AutoTokenizer, 'text_encoder': Gemma2Model, 'transformer': SanaTransformer2DModel,
+                'vae': AutoencoderDC, 'scheduler': SCMScheduler}[name]
+        if name == 'tokenizer':
+            return kind.from_pretrained(self.repo, subfolder=name)
+        if name == 'scheduler':
+            return kind.from_pretrained(self.repo, subfolder=name)
+        return kind.from_pretrained(self.repo, subfolder=name, dtype=torch.float32).eval()
+
+
+def drop(*objs):
+    import gc
+    del objs
+    gc.collect()
 
 
 def random_models(vocab_model):
@@ -304,8 +324,9 @@ def main():
     work = tempfile.mkdtemp()
     torch.set_grad_enabled(False)
 
-    pipe = load(a)
-    te, tr, vae, tok = pipe.text_encoder, pipe.transformer, pipe.vae, pipe.tokenizer
+    parts = Parts(a)
+    tok = parts.get('tokenizer')
+    te = parts.get('text_encoder')
     cfg = te.config
     chi = '\n'.join(instruction())
 
@@ -349,6 +370,11 @@ def main():
         pieces.append(os.path.basename(stem))
         print('exported', pieces[-1], f'layers {first}..{last - 1}')
 
+    m = None  # the last piece holds layers of te
+    del te, kv, h_prefix, emb
+    drop()
+    tr = parts.get('transformer')
+
     # Transformer: (latent, scm timestep, guidance, text) -> model output.
     class Dit(nn.Module):
         # The model's own unpatchify goes through a 6-D reshape, which ncnn has not; with patch
@@ -375,6 +401,11 @@ def main():
         quantize(os.path.join(a.out, 'sana-dit'), a.quantizer, a.bits, a.block)
     print('exported sana-dit')
 
+    guidance = 4.5 * tr.config.guidance_embeds_scale
+    del tr
+    drop()
+    vae = parts.get('vae')
+
     class Vae(nn.Module):
         def __init__(self, v):
             super().__init__()
@@ -386,7 +417,11 @@ def main():
     pnnx_export(Vae(vae), (torch.randn(1, lc, side, side),), None, os.path.join(a.out, 'sana-vae'), work)
     print('exported sana-vae')
 
-    sch = pipe.scheduler.config
+    vae_scale = 2 ** (len(vae.config.decoder_block_out_channels) - 1)
+    scaling = vae.config.scaling_factor
+    del vae
+    drop()
+    sch = parts.get('scheduler').config
     meta = {
         'version': 1,
         'instruction': chi,
@@ -402,17 +437,23 @@ def main():
         'text_pieces': pieces,
         'latent_channels': lc,
         'latent_side': side,
-        'vae_scale': 2 ** (len(vae.config.decoder_block_out_channels) - 1),
-        'scaling_factor': vae.config.scaling_factor,
+        'vae_scale': vae_scale,
+        'scaling_factor': scaling,
         'sigma_data': sch.sigma_data,
         'timesteps': [1.57080, 1.3, 0.0],
-        'guidance': 4.5 * tr.config.guidance_embeds_scale,
+        'guidance': guidance,
     }
     with open(os.path.join(a.out, 'create.json'), 'w') as f:
         json.dump(meta, f, indent=1)
 
     if a.check:
+        # The real model's check runs in its own process (sana_ncnn.py --check), with nothing
+        # else in memory; the tiny random one right here.
         import sana_ncnn
+        pipe = parts.pipe
+        if pipe is None:
+            from diffusers import SanaSprintPipeline
+            pipe = SanaSprintPipeline.from_pretrained(a.repo, dtype=torch.float32)
         sana_ncnn.check(pipe, a.out, a.vocab_model)
     shutil.rmtree(work)
     for f in sorted(os.listdir(a.out)):

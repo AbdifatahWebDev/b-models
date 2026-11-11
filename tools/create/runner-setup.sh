@@ -7,11 +7,13 @@ swap_gb=${1:-16}
 sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
 sudo docker image prune -af > /dev/null 2>&1 || true
 sudo swapoff -a || true
+# SWAP_FILE=/mnt/swapfile puts it on the runner's second disk, leaving / for the work.
+swap="${SWAP_FILE:-/swapfile}"
 sudo rm -f /mnt/swapfile /swapfile
-sudo fallocate -l "${swap_gb}G" /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile > /dev/null
-sudo swapon /swapfile
+sudo fallocate -l "${swap_gb}G" "$swap"
+sudo chmod 600 "$swap"
+sudo mkswap "$swap" > /dev/null
+sudo swapon "$swap"
 sudo mkdir -p "${HF_HOME:-/mnt/hf}"
 sudo chown "$(id -u):$(id -g)" "${HF_HOME:-/mnt/hf}"
 [ -x /usr/bin/time ] || sudo apt-get install -y -qq time

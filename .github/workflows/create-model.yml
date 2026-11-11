@@ -34,6 +34,10 @@ env:
   GEMMA_TOKENIZER: https://raw.githubusercontent.com/google/gemma_pytorch/main/tokenizer/tokenizer.model
   GEMMA_TOKENIZER_SHA256: 61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2
   HF_HOME: /mnt/hf
+  # Big temporary files (pnnx traces) and the outputs go on the runner's second disk.
+  TMPDIR: /mnt/tmp
+  DIST: /mnt/dist
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   convert:
@@ -48,7 +52,9 @@ jobs:
           path: bm
 
       - name: Disk and swap
-        run: bash bm/tools/create/runner-setup.sh 24
+        run: |
+          SWAP_FILE=/mnt/swapfile bash bm/tools/create/runner-setup.sh 24
+          sudo mkdir -p /mnt/tmp /mnt/dist && sudo chown "$(id -u):$(id -g)" /mnt/tmp /mnt/dist
 
       - uses: actions/setup-python@v5
         with:
@@ -73,8 +79,8 @@ jobs:
           curl -fL --retry 3 -o tokenizer.model "$GEMMA_TOKENIZER"
           echo "$GEMMA_TOKENIZER_SHA256  tokenizer.model" | sha256sum -c
 
-      - name: Convert and check against PyTorch
-        timeout-minutes: 240
+      - name: Convert
+        timeout-minutes: 180
         run: |
           set -o pipefail
           mkdir -p results
@@ -82,9 +88,17 @@ jobs:
           [ "${{ inputs.quantize_dit }}" = "true" ] && QDIT="--quantize-dit"
           cd bm/tools/create
           /usr/bin/time -v -o ../../../results/time-convert.txt python3 sana_export.py --repo "$REPO" \
-            --vocab-model ../../../tokenizer.model --out ../../../dist --check \
+            --vocab-model ../../../tokenizer.model --out "$DIST" \
             --quantizer ../../../ncnn-build/tools/quantize/ncnnllm2int --bits "${{ inputs.bits }}" --block "${{ inputs.block }}" $QDIT \
             2>&1 | grep -v -i "warn\|^quantize_\|^\s*$\|^ \|pnnx\|=\|#\|│\|─\|┌\|└\|├" | tee ../../../results/log-convert.txt
+
+      - name: Check against PyTorch
+        timeout-minutes: 90
+        run: |
+          set -o pipefail
+          cd bm/tools/create
+          /usr/bin/time -v -o ../../../results/time-check.txt python3 sana_ncnn.py --check "$DIST" "$REPO" ../../../tokenizer.model \
+            2>&1 | grep -v -i "warn" | tee ../../../results/log-check.txt
 
       - name: Sample pictures from the pieces
         if: always()
@@ -93,18 +107,18 @@ jobs:
           for p in "fox|A red fox sitting in fresh snow in a forest, sharp focus on the eyes" \
                    "cafe|A cozy coffee shop interior with a chalkboard menu, warm lights, plants" \
                    "portrait|Portrait of a young African woman with braided hair smiling, natural window light"; do
-            /usr/bin/time -f "${p%%|*}: %e s, %M KB" python3 sana_ncnn.py ../../../dist "${p#*|}" "../../../results/sample-${p%%|*}.png" \
+            /usr/bin/time -f "${p%%|*}: %e s, %M KB" python3 sana_ncnn.py "$DIST" "${p#*|}" "../../../results/sample-${p%%|*}.png" \
               --vocab ../../../tokenizer.model 2>&1 | tail -1 | tee -a ../../../results/log-samples.txt
           done
-          cp ../../../dist/check-create.png ../../../results/ 2>/dev/null || true
-          rm -f ../../../dist/check-create.png
+          cp "$DIST/check-create.png" ../../../results/ 2>/dev/null || true
+          rm -f "$DIST/check-create.png"
 
       - name: Publish
         if: success()
         run: |
-          cd dist && sha256sum * | tee ../results/sha256.txt && cd ..
-          ls -la dist results
-          gh release create create-model -R "$GITHUB_REPOSITORY" dist/* results/* --title "Create model (SANA-Sprint 0.6B)" \
+          (cd "$DIST" && sha256sum *) | tee results/sha256.txt
+          ls -la "$DIST" results
+          gh release create create-model -R "$GITHUB_REPOSITORY" "$DIST"/* results/* --title "Create model (SANA-Sprint 0.6B)" \
             --notes "SANA-Sprint 0.6B (NVIDIA, Apache-2.0) with its Gemma-2-2B text encoder (Gemma terms of use), converted to ncnn pieces for Brekwol Upscale's Create screen by tools/create/sana_export.py. Text encoder in ${{ inputs.bits }}-bit blocks of ${{ inputs.block }}. check-create.png: PyTorch (left) and the pieces (right) from the same noise; log-convert.txt has the numbers."
 
       - name: Keep the logs

@@ -150,6 +150,14 @@ def check(pipe, dist, vocab_model):
 
 
 def main():
+    if sys.argv[1] == '--check':
+        # python sana_ncnn.py --check DIST REPO VOCAB_MODEL
+        import torch
+        from diffusers import SanaSprintPipeline
+        torch.set_grad_enabled(False)
+        pipe = SanaSprintPipeline.from_pretrained(sys.argv[3], dtype=torch.float32)
+        check(pipe, sys.argv[2], sys.argv[4])
+        return
     dist, prompt, out = sys.argv[1], sys.argv[2], sys.argv[3]
     seed = int(sys.argv[sys.argv.index('--seed') + 1]) if '--seed' in sys.argv else 42
     vocab = sys.argv[sys.argv.index('--vocab') + 1]
