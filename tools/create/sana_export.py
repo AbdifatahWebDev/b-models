@@ -21,10 +21,12 @@ What the app runs (engine/create.cpp follows tools/create/sana_ncnn.py, which is
    sana-dit takes the latent (32 x 32 x 32 for 1024 px), the SCM timestep, the guidance value and
    the text (L x 2304) and gives the model output; the arithmetic between the steps is in
    create.json and sana_ncnn.py.
-3. Pixels. sana-vae (the DC-AE decoder) turns latent / scaling_factor into RGB in [-1, 1].
+3. Pixels. The DC-AE decoder turns latent / scaling_factor into RGB in [-1, 1]: sana-vae-head
+   (its attention stages, whole, up to 128 px) and sana-vae-tail (convolutions only) in tiles of
+   vae_tile head pixels with vae_margin around each, so 1024 px fits in a phone's memory.
 
 Outputs, into --out: gemma-vocab.bin, gemma-embed.bin, text-h0.bin, text-NN.param/.bin,
-sana-dit.param/.bin, sana-vae.param/.bin, create.json.
+sana-dit.param/.bin, sana-vae-head.param/.bin, sana-vae-tail.param/.bin, create.json.
 
 Needs torch, diffusers, transformers, sentencepiece, numpy, pnnx (and ncnn for --check).
 """
@@ -222,38 +224,139 @@ def pnnx_export(module, inputs, inputs2, stem, work, fp16=True):
             (shutil.rmtree if os.path.isdir(p) else os.remove)(p)
 
 
-def vae_trace_sides(side):
-    """The two latent sides the decoder is traced at: smaller than [side], so ncnn runs it at a size
-    it was not traced at (checked by export_vae)."""
-    small = max(side // 4, 4)
-    return small, max(side // 2, small + 2)
+class VaeHead(nn.Module):
+    """The decoder up to its first local-only stage: conv_in and the attention stages."""
+
+    def __init__(self, dec, k):
+        super().__init__()
+        self.dec, self.k = dec, k
+
+    def forward(self, z):
+        d = self.dec
+        h = d.conv_in(z)
+        if d.in_shortcut:
+            h = h + z.repeat_interleave(d.in_shortcut_repeats, dim=1)
+        for i in reversed(range(self.k, len(d.up_blocks))):
+            h = d.up_blocks[i](h)
+        return h
 
 
-def export_vae(module, channels, side, stem, work):
-    """Exports the decoder traced at small sizes and checks it in ncnn at the full [side]."""
-    small, mid = vae_trace_sides(side)
-    pnnx_export(module, (torch.randn(1, channels, small, small),), (torch.randn(1, channels, mid, mid),), stem, work)
+class VaeTail(nn.Module):
+    """The rest: convolution stages, pixel shuffles and per-pixel norms only, so it can run in tiles."""
+
+    def __init__(self, dec, k):
+        super().__init__()
+        self.dec, self.k = dec, k
+
+    def forward(self, h):
+        d = self.dec
+        for i in reversed(range(self.k)):
+            h = d.up_blocks[i](h)
+        h = d.norm_out(h.movedim(1, -1)).movedim(-1, 1)
+        return d.conv_out(d.conv_act(h))
+
+
+def vae_split(dec):
+    """How many of the decoder's top stages are local (ResBlocks and upsampling convolutions):
+    those form the tail. Returns (k, head scale, tail scale, tail channels, tail margin): the margin
+    is the tail's reach in head pixels, rounded up, plus one."""
+    from diffusers.models.autoencoders.autoencoder_dc import DCUpBlock2d, ResBlock
+    n = len(dec.up_blocks)
+    k = 0
+    while k < n and all(isinstance(m, (DCUpBlock2d, ResBlock)) for m in dec.up_blocks[k]):
+        k += 1
+    assert k > 0, 'the decoder has no local stages to tile'
+
+    def ups(i):
+        return sum(1 for m in dec.up_blocks[i] if isinstance(m, DCUpBlock2d))
+
+    head_scale = 2 ** sum(ups(i) for i in range(k, n))
+    tail_scale = 2 ** sum(ups(i) for i in range(k))
+    reach, scale = 0.0, 1
+
+    def conv(c):
+        assert c.stride == (1, 1) and c.kernel_size[0] == c.kernel_size[1]
+        return (c.kernel_size[0] // 2) * c.dilation[0]
+
+    for i in reversed(range(k)):
+        for m in dec.up_blocks[i]:
+            if isinstance(m, DCUpBlock2d):
+                if m.interpolate:
+                    scale *= m.factor
+                    reach += conv(m.conv) / scale
+                else:
+                    reach += conv(m.conv) / scale
+                    scale *= m.factor
+            else:
+                reach += (conv(m.conv1) + conv(m.conv2)) / scale
+    out = dec.conv_out
+    if isinstance(out, DCUpBlock2d):
+        reach += conv(out.conv) / scale
+        scale *= out.factor
+        tail_scale *= out.factor
+    else:
+        reach += conv(out) / scale
+    channels = dec.up_blocks[k - 1][0].conv.in_channels if isinstance(dec.up_blocks[k - 1][0], DCUpBlock2d) \
+        else dec.up_blocks[k - 1][0].conv1.in_channels
+    return k, head_scale, tail_scale, channels, math.ceil(reach) + 1
+
+
+def run_ncnn(stem, inputs):
     import ncnn
-    torch.manual_seed(1)
-    z = torch.randn(1, channels, side, side)
-    want = module(z)[0].numpy()
     net = ncnn.Net()
     net.opt.use_vulkan_compute = False
     net.opt.num_threads = int(os.environ.get('OMP_NUM_THREADS', '4'))
     net.load_param(stem + '.param')
     net.load_model(stem + '.bin')
     ex = net.create_extractor()
-    zn = np.ascontiguousarray(z[0].numpy())  # ncnn.Mat shares this memory: keep it alive
-    ex.input('in0', ncnn.Mat(zn))
-    _, out = ex.extract('out0')
-    got = np.array(out)
-    del ex, net, zn
+    keep = [np.ascontiguousarray(a, dtype=np.float32) for a in inputs]  # ncnn.Mat shares this memory
+    for name, a in zip(net.input_names(), keep):
+        ex.input(name, ncnn.Mat(a))
+    r, out = ex.extract(sorted(net.output_names())[0])
+    assert r == 0
+    return np.array(out)
+
+
+def export_vae(vae, side, out, work):
+    """Exports the DC-AE decoder as sana-vae-head and sana-vae-tail and checks them, the tail run in
+    tiles as the app runs it, against PyTorch's whole decoder at the full [side].
+
+    At 1024 px the whole decoder needs over 13 GB in ncnn (and pnnx more than 29 GB to convert
+    it). The attention stages work on small images (128 px and less) and stay whole in the head;
+    the tail is convolutions, pixel shuffles and per-pixel norms only, so tiles with a margin of
+    its reach give exactly the whole image. Both are traced at small sizes (two sizes make the
+    shapes dynamic) and run here at sizes they were not traced at."""
+    import sana_ncnn
+    dec = vae.decoder
+    lc = vae.config.latent_channels
+    k, head_scale, tail_scale, channels, margin = vae_split(dec)
+    hs = side * head_scale
+    tile = max(hs // 4, 1)
+    h_small = max(side // 4, 4)
+    h_mid = max(side // 2, h_small + 2)
+    t_small = max(hs // 8, 4)
+    t_mid = t_small + max(t_small // 2, 2)
+    head, tail = VaeHead(dec, k).eval(), VaeTail(dec, k).eval()
+    pnnx_export(head, (torch.randn(1, lc, h_small, h_small),), (torch.randn(1, lc, h_mid, h_mid),),
+                os.path.join(out, 'sana-vae-head'), work)
+    pnnx_export(tail, (torch.randn(1, channels, t_small, t_small),), (torch.randn(1, channels, t_mid, t_mid),),
+                os.path.join(out, 'sana-vae-tail'), work)
+
+    torch.manual_seed(1)
+    z = torch.randn(1, lc, side, side)
+    want = vae.decode(z, return_dict=False)[0][0].numpy()
+    h = run_ncnn(os.path.join(out, 'sana-vae-head'), [z[0].numpy()])
+    assert h.shape == (channels, hs, hs), h.shape
+    got = sana_ncnn.tiled(lambda x: run_ncnn(os.path.join(out, 'sana-vae-tail'), [x]), h, tile, margin, tail_scale)
     assert got.shape == want.shape, (got.shape, want.shape)
     mse = float(np.mean((np.clip(got, -1, 1) - np.clip(want, -1, 1)) ** 2))
     psnr = 10 * np.log10(4 / max(mse, 1e-12))  # pixels in [-1, 1]: peak-to-peak 2
-    print(f'sana-vae at {side}x{side} (traced at {small} and {mid}): PSNR {psnr:.1f} dB against PyTorch')
+    print(f'sana-vae at {side}x{side}: head traced at {h_small} and {h_mid}, tail at {t_small} and {t_mid}, '
+          f'run in tiles of {tile} with margin {margin}: PSNR {psnr:.1f} dB against PyTorch')
     if psnr < 30:
         raise SystemExit('sana-vae does not match PyTorch at the full size')
+    return {'vae_head_scale': head_scale, 'vae_tail_scale': tail_scale, 'vae_tail_channels': channels,
+            'vae_tile': tile, 'vae_margin': margin}
 
 
 def quantize(stem, tool, bits, block):
@@ -366,7 +469,7 @@ def merge_meta(out):
     parts = [os.path.join(out, f'meta-{p}.json') for p in ('text', 'image')]
     if not all(os.path.exists(p) for p in parts):
         return
-    meta = {'version': 1}
+    meta = {'version': 2}  # 2: the decoder as head + tiled tail
     for p in parts:
         meta.update(json.load(open(p)))
         os.remove(p)
@@ -494,20 +597,8 @@ def main():
         del tr
         drop()
         vae = parts.get('vae')
-
-        class Vae(nn.Module):
-            def __init__(self, v):
-                super().__init__()
-                self.v = v
-
-            def forward(self, z):
-                return self.v.decode(z, return_dict=False)[0]
-
-        # pnnx keeps every activation while it converts: at the full latent (1024 px) that took more
-        # than 29 GB. The decoder is convolutions and attention over any size, so it is traced at a
-        # quarter and a half of the side (two sizes make the shapes dynamic) and checked at full size.
-        export_vae(Vae(vae), lc, side, os.path.join(a.out, 'sana-vae'), work)
-        print('exported sana-vae')
+        tiles = export_vae(vae, side, a.out, work)
+        print('exported sana-vae-head and sana-vae-tail')
 
         vae_scale = 2 ** (len(vae.config.decoder_block_out_channels) - 1)
         scaling = vae.config.scaling_factor
@@ -522,6 +613,7 @@ def main():
             'sigma_data': sch.sigma_data,
             'timesteps': [1.57080, 1.3, 0.0],
             'guidance': guidance,
+            **tiles,
         })
 
     merge_meta(a.out)

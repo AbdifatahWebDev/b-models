@@ -95,8 +95,30 @@ class Pieces:
             denoised = math.cos(s) * latents - math.sin(s) * f
             latents = math.cos(t) * denoised + math.sin(t) * noise[i + 1] * sd
         z = denoised / sd / m['scaling_factor']
-        img = self.run(self.net('sana-vae'), [z])
+        h = self.run(self.net('sana-vae-head'), [z])
+        tail = self.net('sana-vae-tail')
+        img = tiled(lambda x: self.run(tail, [x]), h, m['vae_tile'], m['vae_margin'], m['vae_tail_scale'])
         return np.clip((img + 1) * 127.5 + 0.5, 0, 255).astype(np.uint8).transpose(1, 2, 0)
+
+
+def tiled(tail, h, tile, margin, scale):
+    """Runs [tail] (C x H x W -> 3 x H*scale x W*scale, local operations only) over [h] in tiles of
+    [tile] pixels, each read with [margin] pixels around it inside the image and cropped back, as
+    the app does (engine/create.cpp): the same as running it on the whole of [h]."""
+    _, H, W = h.shape
+    out = None
+    for y0 in range(0, H, tile):
+        y1 = min(y0 + tile, H)
+        a0, a1 = max(0, y0 - margin), min(H, y1 + margin)
+        for x0 in range(0, W, tile):
+            x1 = min(x0 + tile, W)
+            b0, b1 = max(0, x0 - margin), min(W, x1 + margin)
+            t = tail(np.ascontiguousarray(h[:, a0:a1, b0:b1]))
+            if out is None:
+                out = np.zeros((t.shape[0], H * scale, W * scale), np.float32)
+            out[:, y0 * scale:y1 * scale, x0 * scale:x1 * scale] = \
+                t[:, (y0 - a0) * scale:(y1 - a0) * scale, (x0 - b0) * scale:(x1 - b0) * scale]
+    return out
 
 
 def tokenize(vocab_model, meta, prompt):

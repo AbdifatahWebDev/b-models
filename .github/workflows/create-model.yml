@@ -5,8 +5,9 @@ name: Create model (SANA-Sprint 0.6B)
 # more than one model (one runner holding the whole pipeline lost contact three times):
 #   text   the Gemma vocabulary, int8 embedding rows and the text encoder in pieces of two layers
 #          with the instruction prefix cached, block-quantized by ncnn's ncnnllm2int;
-#   image  the transformer and the DC-AE decoder (traced at 256 and 512 px, since pnnx needed
-#          ~29 GB at 1024 px, and checked in ncnn at 1024 px);
+#   image  the transformer and the DC-AE decoder, split into its attention stages (whole) and its
+#          convolution stages (run in tiles: whole, 1024 px needed over 13 GB), traced small and
+#          checked in ncnn at 1024 px against PyTorch;
 #   check  the pieces through tools/create/sana_ncnn.py (what the app does) against PyTorch, text
 #          embeddings and a whole image, then three sample pictures, and release create-model.
 # Every job prints memory and disk use each minute. Started by hand only.
@@ -226,6 +227,8 @@ jobs:
         run: |
           (cd "$DIST" && sha256sum *) | tee results/sha256.txt
           ls -la "$DIST" results
+          # A new run replaces the last release (its files change between versions).
+          gh release delete create-model -R "$GITHUB_REPOSITORY" -y --cleanup-tag 2>/dev/null || true
           gh release create create-model -R "$GITHUB_REPOSITORY" "$DIST"/* results/* --title "Create model (SANA-Sprint 0.6B)" \
             --notes "SANA-Sprint 0.6B (NVIDIA, Apache-2.0) with its Gemma-2-2B text encoder (Gemma terms of use), converted to ncnn pieces for Brekwol Upscale's Create screen by tools/create/sana_export.py. Text encoder in ${{ inputs.bits }}-bit blocks of ${{ inputs.block }}. check-create.png: PyTorch (left) and the pieces (right) from the same noise; log-check.txt has the numbers."
       - uses: actions/upload-artifact@v4
