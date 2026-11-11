@@ -5,7 +5,8 @@ name: Create model (SANA-Sprint 0.6B)
 # more than one model (one runner holding the whole pipeline lost contact three times):
 #   text   the Gemma vocabulary, int8 embedding rows and the text encoder in pieces of two layers
 #          with the instruction prefix cached, block-quantized by ncnn's ncnnllm2int;
-#   image  the transformer and the DC-AE decoder;
+#   image  the transformer and the DC-AE decoder (pnnx needs ~29 GB on the 1024 px decoder:
+#          48 GB of swap);
 #   check  the pieces through tools/create/sana_ncnn.py (what the app does) against PyTorch, text
 #          embeddings and a whole image, then three sample pictures, and release create-model.
 # Every job prints memory and disk use each minute. Started by hand only.
@@ -116,7 +117,7 @@ jobs:
           path: bm
       - name: Disk and swap
         run: |
-          SWAP_FILE=/mnt/swapfile bash bm/tools/create/runner-setup.sh 16
+          SWAP_FILE=/mnt/swapfile bash bm/tools/create/runner-setup.sh 48
           sudo mkdir -p /mnt/tmp /mnt/dist && sudo chown "$(id -u):$(id -g)" /mnt/tmp /mnt/dist
       - uses: actions/setup-python@v5
         with:
@@ -174,7 +175,7 @@ jobs:
           path: bm
       - name: Disk and swap
         run: |
-          SWAP_FILE=/mnt/swapfile bash bm/tools/create/runner-setup.sh 16
+          SWAP_FILE=/mnt/swapfile bash bm/tools/create/runner-setup.sh 48
           sudo mkdir -p /mnt/tmp /mnt/dist && sudo chown "$(id -u):$(id -g)" /mnt/tmp /mnt/dist
       - uses: actions/setup-python@v5
         with:
