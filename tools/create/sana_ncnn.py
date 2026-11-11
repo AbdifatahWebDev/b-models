@@ -149,14 +149,86 @@ def check(pipe, dist, vocab_model):
     assert psnr > 25, 'image differs from PyTorch'
 
 
+def reference_image(transformer, vae, sigma_data, text, noise, timesteps, guidance):
+    """PyTorch: the same SCM loop as SanaSprintPipeline (sana_export's tiny check proves they
+    agree), on [text] (L x hidden) and the given noise."""
+    import torch
+    t_text = torch.from_numpy(text).unsqueeze(0)
+    latents = torch.from_numpy(noise[0]).unsqueeze(0) * sigma_data
+    denoised = None
+    g = torch.tensor([guidance])
+    for i in range(len(timesteps) - 1):
+        s, t = timesteps[i], timesteps[i + 1]
+        c = math.sin(s) / (math.cos(s) + math.sin(s))
+        r = math.sqrt(c * c + (1 - c) ** 2)
+        xin = latents / sigma_data * r
+        out = transformer(xin, encoder_hidden_states=t_text, timestep=torch.tensor([c]), guidance=g, return_dict=False)[0]
+        f = ((1 - 2 * c) * xin + (1 - 2 * c + 2 * c * c) * out) / r * sigma_data
+        denoised = math.cos(s) * latents - math.sin(s) * f
+        latents = math.cos(t) * denoised + math.sin(t) * torch.from_numpy(noise[i + 1]).unsqueeze(0) * sigma_data
+    img = vae.decode(denoised / sigma_data / vae.config.scaling_factor, return_dict=False)[0][0].numpy()
+    return np.clip((img + 1) * 127.5 + 0.5, 0, 255).astype(np.uint8).transpose(1, 2, 0)
+
+
+def check_staged(dist, repo, vocab_model):
+    """The real model's check, one part in memory at a time: Gemma (fp32) against the text
+    pieces, then the transformer and decoder (fp32) against the image pieces."""
+    import gc
+    import torch
+    from transformers import AutoTokenizer, Gemma2Model
+    torch.set_grad_enabled(False)
+    pc = Pieces(dist)
+    m = pc.meta
+    prompts = ['A red fox sitting in fresh snow in a forest, sharp focus on the eyes',
+               'A cozy coffee shop interior with a chalkboard menu that says "BREKWOL CAFE"',
+               'Portrait of a young African woman with braided hair smiling, natural window light']
+    tok = AutoTokenizer.from_pretrained(repo, subfolder='tokenizer')
+    tok.padding_side = 'right'  # as SanaSprintPipeline sets it
+    te = Gemma2Model.from_pretrained(repo, subfolder='text_encoder', dtype=torch.float32).eval()
+    max_all = m['instruction_tokens'] + 300 - 2
+    sel = [0] + list(range(-300 + 1, 0))
+    worst, ref_text, got_text = 1.0, None, None
+    for prompt in prompts:
+        text = m['instruction'] + prompt.lower().strip()
+        ids = tokenize(vocab_model, m, prompt)
+        enc = tok(text, padding='max_length', max_length=max_all, truncation=True, add_special_tokens=True, return_tensors='pt')
+        hf = enc.input_ids[0].tolist()
+        assert ids == hf[:len(ids)], f'tokenizer differs from HF on: {prompt}'
+        h = te(enc.input_ids, attention_mask=enc.attention_mask).last_hidden_state[0][sel]
+        ref = h[enc.attention_mask[0][sel].bool()].numpy()
+        got = pc.text(ids)
+        assert ref.shape == got.shape, (ref.shape, got.shape)
+        cos = (ref * got).sum(1) / np.linalg.norm(ref, axis=1) / np.linalg.norm(got, axis=1)
+        print(f'text: {len(got)} tokens, cosine min {cos.min():.5f} mean {cos.mean():.5f}  ({prompt[:40]})', flush=True)
+        worst = min(worst, float(cos.min()))
+        if ref_text is None:
+            ref_text, got_text = ref, got
+    del te
+    gc.collect()
+
+    from diffusers import AutoencoderDC, SanaTransformer2DModel
+    tr = SanaTransformer2DModel.from_pretrained(repo, subfolder='transformer', dtype=torch.float32).eval()
+    vae = AutoencoderDC.from_pretrained(repo, subfolder='vae', dtype=torch.float32).eval()
+    shape = (m['latent_channels'], m['latent_side'], m['latent_side'])
+    rng = np.random.default_rng(42)
+    noise = [rng.standard_normal(shape).astype(np.float32) for _ in range(3)]
+    ref = reference_image(tr, vae, m['sigma_data'], ref_text, noise, m['timesteps'], m['guidance'])
+    del tr, vae
+    gc.collect()
+    got = pc.image(got_text, noise)
+    mse = np.mean((ref.astype(np.float64) - got.astype(np.float64)) ** 2)
+    psnr = 10 * math.log10(255 ** 2 / max(mse, 1e-9))
+    print(f'image: PSNR {psnr:.1f} dB against PyTorch', flush=True)
+    from PIL import Image
+    Image.fromarray(np.concatenate([ref, got], 1)).save(os.path.join(dist, 'check-create.png'))
+    assert worst > 0.99, f'text embeddings differ from PyTorch (cosine {worst:.4f})'
+    assert psnr > 25, 'image differs from PyTorch'
+
+
 def main():
     if sys.argv[1] == '--check':
         # python sana_ncnn.py --check DIST REPO VOCAB_MODEL
-        import torch
-        from diffusers import SanaSprintPipeline
-        torch.set_grad_enabled(False)
-        pipe = SanaSprintPipeline.from_pretrained(sys.argv[3], dtype=torch.float32)
-        check(pipe, sys.argv[2], sys.argv[4])
+        check_staged(sys.argv[2], sys.argv[3], sys.argv[4])
         return
     dist, prompt, out = sys.argv[1], sys.argv[2], sys.argv[3]
     seed = int(sys.argv[sys.argv.index('--seed') + 1]) if '--seed' in sys.argv else 42

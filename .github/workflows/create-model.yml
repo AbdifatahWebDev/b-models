@@ -90,7 +90,7 @@ jobs:
           /usr/bin/time -v -o ../../../results/time-convert.txt python3 sana_export.py --repo "$REPO" \
             --vocab-model ../../../tokenizer.model --out "$DIST" \
             --quantizer ../../../ncnn-build/tools/quantize/ncnnllm2int --bits "${{ inputs.bits }}" --block "${{ inputs.block }}" $QDIT \
-            2>&1 | grep -v -i "warn\|^quantize_\|^\s*$\|^ \|pnnx\|=\|#\|│\|─\|┌\|└\|├" | tee ../../../results/log-convert.txt
+            2>&1 | grep --line-buffered -v -i "warn\|^quantize_\|^\s*$\|^ \|pnnx\|=\|#\|│\|─\|┌\|└\|├" | tee ../../../results/log-convert.txt
 
       - name: Check against PyTorch
         timeout-minutes: 90
@@ -98,7 +98,7 @@ jobs:
           set -o pipefail
           cd bm/tools/create
           /usr/bin/time -v -o ../../../results/time-check.txt python3 sana_ncnn.py --check "$DIST" "$REPO" ../../../tokenizer.model \
-            2>&1 | grep -v -i "warn" | tee ../../../results/log-check.txt
+            2>&1 | grep --line-buffered -v -i "warn" | tee ../../../results/log-check.txt
 
       - name: Sample pictures from the pieces
         if: always()

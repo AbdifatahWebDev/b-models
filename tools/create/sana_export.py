@@ -29,6 +29,7 @@ sana-dit.param/.bin, sana-vae.param/.bin, create.json.
 Needs torch, diffusers, transformers, sentencepiece, numpy, pnnx (and ncnn for --check).
 """
 import argparse
+import copy
 import json
 import math
 import os
@@ -69,7 +70,8 @@ class GemmaLayers(nn.Module):
     def __init__(self, model, first, last, prefix_kv, final):
         super().__init__()
         cfg = model.config
-        self.layers = nn.ModuleList(model.layers[first:last])
+        # fp32 copies of just these layers: the model itself stays in bf16 (half the memory).
+        self.layers = nn.ModuleList(copy.deepcopy(l).float() for l in model.layers[first:last])
         self.heads = cfg.num_attention_heads
         self.kv_heads = cfg.num_key_value_heads
         self.dim = cfg.head_dim
@@ -77,7 +79,7 @@ class GemmaLayers(nn.Module):
         self.softcap = cfg.attn_logit_softcapping
         self.eps = cfg.rms_norm_eps
         self.final = final
-        self.norm_w = model.norm.weight if final else None
+        self.norm_w = nn.Parameter(model.norm.weight.detach().float().clone()) if final else None
         for i, (k, v) in enumerate(prefix_kv[first:last]):
             self.register_buffer(f'pk{i}', k.clone())  # [1, kv_heads, P, D]
             self.register_buffer(f'pv{i}', v.clone())
@@ -151,7 +153,7 @@ def run_layers(model, x, start, prefix_kv=None, collect=False):
         piece = GemmaLayers(model, li, li + 1, prefix_kv, final=False)
         if collect:
             # Keys and values after RoPE, recomputed the same way the piece does.
-            layer = model.layers[li]
+            layer = piece.layers[0]
             a = layer.self_attn
             h = rms(out, layer.input_layernorm.weight, cfg.rms_norm_eps)
             k = a.k_proj(h).view(1, n, cfg.num_key_value_heads, cfg.head_dim).transpose(1, 2)
@@ -159,7 +161,8 @@ def run_layers(model, x, start, prefix_kv=None, collect=False):
             k = k * cos.unsqueeze(0) + rotate_half(k) * sin.unsqueeze(0)
             kv.append((torch.cat((prefix_kv[li][0], k), 2), torch.cat((prefix_kv[li][1], v), 2)))
         out = piece(out, cos.unsqueeze(0), sin.unsqueeze(0), mask)
-    out = rms(out, model.norm.weight, cfg.rms_norm_eps)
+        del piece
+    out = rms(out, model.norm.weight.float(), cfg.rms_norm_eps)
     return out, kv
 
 
@@ -227,16 +230,22 @@ def quantize(stem, tool, bits, block):
 
 
 def write_embed(weight, path):
-    """int8 rows with one fp32 scale each: "GEMB", u32 1, u32 rows, u32 cols, f32 scales, i8 data."""
-    w = weight.float().numpy()
-    scale = np.abs(w).max(axis=1) / 127.0
-    scale[scale == 0] = 1.0
-    q = np.clip(np.round(w / scale[:, None]), -127, 127).astype(np.int8)
+    """int8 rows with one fp32 scale each: "GEMB", u32 1, u32 rows, u32 cols, f32 scales, i8 data.
+    Works in chunks of rows (the fp32 table is 2.4 GB). Returns (scales, int8 rows)."""
+    rows, cols = weight.shape
+    scale = np.empty(rows, np.float32)
+    q = np.empty((rows, cols), np.int8)
+    for i in range(0, rows, 8192):
+        w = weight[i:i + 8192].detach().float().numpy()
+        sc = np.abs(w).max(axis=1) / 127.0
+        sc[sc == 0] = 1.0
+        scale[i:i + 8192] = sc
+        q[i:i + 8192] = np.clip(np.round(w / sc[:, None]), -127, 127).astype(np.int8)
     with open(path, 'wb') as f:
-        f.write(b'GEMB' + struct.pack('<III', 1, w.shape[0], w.shape[1]))
+        f.write(b'GEMB' + struct.pack('<III', 1, rows, cols))
         f.write(scale.astype('<f4').tobytes())
         f.write(q.tobytes())
-    return (q.astype(np.float32) * scale[:, None])
+    return scale, q
 
 
 # ---------------------------------------------------------------- models
@@ -260,7 +269,9 @@ class Parts:
             return kind.from_pretrained(self.repo, subfolder=name)
         if name == 'scheduler':
             return kind.from_pretrained(self.repo, subfolder=name)
-        return kind.from_pretrained(self.repo, subfolder=name, dtype=torch.float32).eval()
+        # Gemma stays in bf16 (5 GB, not 10): its pieces are copied to fp32 two layers at a time.
+        dtype = torch.bfloat16 if name == 'text_encoder' else torch.float32
+        return kind.from_pretrained(self.repo, subfolder=name, dtype=dtype).eval()
 
 
 def drop(*objs):
@@ -339,11 +350,13 @@ def main():
     print(f'instruction: {len(chi_ids)} tokens, {prefix} cached')
 
     # Embedding rows (int8) and the cached prefix.
-    emb = write_embed(te.embed_tokens.weight, os.path.join(a.out, 'gemma-embed.bin'))
+    emb_scale, emb_q = write_embed(te.embed_tokens.weight, os.path.join(a.out, 'gemma-embed.bin'))
+    if not a.random:
+        te.embed_tokens = None  # 1.2 GB that nothing needs any more (the tiny check still uses it)
     normalizer = float(cfg.hidden_size) ** 0.5
 
     def embed(ids):
-        return torch.from_numpy(emb[ids] * np.float32(normalizer)).unsqueeze(0)
+        return torch.from_numpy(emb_q[ids].astype(np.float32) * emb_scale[ids, None] * np.float32(normalizer)).unsqueeze(0)
 
     x0 = embed(chi_ids[:prefix])
     h_prefix, kv = run_layers(te, x0, 0, collect=True)
@@ -371,7 +384,7 @@ def main():
         print('exported', pieces[-1], f'layers {first}..{last - 1}')
 
     m = None  # the last piece holds layers of te
-    del te, kv, h_prefix, emb
+    del te, kv, h_prefix, emb_q
     drop()
     tr = parts.get('transformer')
 
