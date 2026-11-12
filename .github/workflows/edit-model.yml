@@ -206,7 +206,7 @@ jobs:
           bash -c "$MONITOR" &
           nice -n 10 python3 bm/tools/edit/klein_check.py reference "$REPO" /mnt/work inputs 2>&1 \
             | grep --line-buffered -v -i "warn" | tee results/log-reference.txt
-          rm -rf /mnt/hf
+          sudo rm -rf /mnt/hf || true
       - name: The pieces on the same prompts and noise
         timeout-minutes: 180
         run: |
