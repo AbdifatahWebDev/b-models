@@ -275,7 +275,7 @@ def export_transformer(tr, nt, a, work, singles_per_piece):
         return torch.randn(1, nt + n, hd), torch.randn(1, nt + n, hd)
 
     pnnx_export(f32(KleinTime(tr)), (torch.tensor([0.5]),), None, stem('klein-time'), work, fp16=fp16)
-    print('exported klein-time', flush=True)
+    q('klein-time')
     doubles, singles = [], []
     for i in range(len(tr.transformer_blocks)):
         m = f32(KleinDouble(tr, i, nt))

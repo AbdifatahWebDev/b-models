@@ -87,3 +87,12 @@ Text ids are (0,0,0,i); image (0,y,x,0); reference k has t = 10·(k+1) (check _p
   untraced length. Gotchas: ncnn.Mat(numpy) must be .clone()d (unaligned memory crashed in-place
   layers in light mode); pnnx drops a plain x[:, nt:] slice (use tensor_split, and tie unused
   halves in so they do not become outputs); pieces are deep-copied to fp32 from a bf16 model.
+- Run #3 (fac4ad8): both jobs pass. Text 17 min, 9 × 322 MB + 390 MB embedding; real tokens
+  0.9996. Transformer 36 min, peak 13.6 GB: five double pieces of 261-286 MB, five single pieces
+  of 521-560 MB, klein-time 304 MB (was not quantized; now is). One call against the bf16 model
+  (512 text + 54 image tokens): cosine 0.9976, max difference 0.24 of a 3.0 range.
+  So far about 7.6 GB.
+- Next (step 3): VAE encoder/decoder export (whole at 512 px first; measure memory), sampler in
+  klein_ncnn.py (sigmas linspace(1, 1/n, n) shifted by mu = compute_empirical_mu(tokens, steps),
+  Euler steps on velocity, latents × bn_std + bn_mean, 2×2 unpatchify, decode), a check job that
+  compares a picture and edits against the pipeline from the same noise, then the release.
