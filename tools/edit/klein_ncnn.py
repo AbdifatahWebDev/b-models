@@ -4,6 +4,7 @@
 So far: Pieces.text(ids, real) -> the transformer's text input [tokens, 3 * hidden].
 """
 import json
+import math
 import os
 import struct
 
@@ -38,6 +39,38 @@ def rope_image(ids, axes, theta):
     return np.concatenate(cos, 1).astype(np.float32), np.concatenate(sin, 1).astype(np.float32)
 
 
+def empirical_mu(tokens, steps):
+    """diffusers' compute_empirical_mu: the sigma shift for [tokens] image tokens and [steps] steps."""
+    a1, b1 = 8.73809524e-05, 1.89833333
+    a2, b2 = 0.00016927, 0.45666666
+    if tokens > 4300:
+        return a2 * tokens + b2
+    m200, m10 = a2 * tokens + b2, a1 * tokens + b1
+    a = (m200 - m10) / 190.0
+    return a * steps + (m200 - 200.0 * a)
+
+
+def sigmas(tokens, steps):
+    """The sampler's sigmas: linspace(1, 1/steps) shifted exponentially by mu, then 0
+    (FlowMatchEulerDiscreteScheduler with dynamic shifting, as Flux2KleinPipeline sets it up)."""
+    mu = empirical_mu(tokens, steps)
+    s = np.linspace(1.0, 1.0 / steps, steps)
+    s = math.exp(mu) / (math.exp(mu) + (1.0 / s - 1.0))
+    return np.append(s, 0.0).astype(np.float32)
+
+
+def patchify(z):
+    """[C, h, w] -> [4C, h/2, w/2] (Flux2KleinPipeline._patchify_latents)."""
+    c, h, w = z.shape
+    return z.reshape(c, h // 2, 2, w // 2, 2).transpose(0, 2, 4, 1, 3).reshape(c * 4, h // 2, w // 2)
+
+
+def unpatchify(z):
+    """[4C, h, w] -> [C, 2h, 2w]."""
+    c, h, w = z.shape
+    return z.reshape(c // 4, 2, 2, h, w).transpose(0, 3, 1, 4, 2).reshape(c // 4, h * 2, w * 2)
+
+
 class Pieces:
     def __init__(self, dist, threads=None):
         import ncnn
@@ -45,7 +78,7 @@ class Pieces:
         self.dist = dist
         self.threads = threads or int(os.environ.get('OMP_NUM_THREADS', '4'))
         self.meta = {}
-        for name in ('meta-text.json', 'meta-image.json', 'edit.json'):
+        for name in ('meta-text.json', 'meta-image.json', 'meta-vae.json', 'edit.json'):
             p = os.path.join(dist, name)
             if os.path.exists(p):
                 self.meta.update(json.load(open(p)))
@@ -119,3 +152,34 @@ class Pieces:
         for k, name in enumerate(m['single_pieces']):
             x = self.run(self.net(name), [x, ms, cos, sin] + ([temb] if k == last else []))
         return x.reshape(tokens.shape[0], -1)
+
+    def encode(self, rgb):
+        """A reference picture, RGB in [-1, 1] [3, H, W] (sides multiples of 16) -> its tokens
+        [h·w, 4C] and grid (h, w)."""
+        m = self.meta
+        z = patchify(self.run(self.net('klein-enc'), [rgb]))
+        z = (z - np.array(m['bn_mean'], np.float32)[:, None, None]) / np.array(m['bn_std'], np.float32)[:, None, None]
+        return z.reshape(z.shape[0], -1).T.copy(), z.shape[1:]
+
+    def generate(self, text, noise, references=(), steps=4, progress=None):
+        """text [nt, J]; noise [4C, h, w] standard normal (the pipeline's latents); references:
+        RGB arrays in [-1, 1] -> RGB in [-1, 1] [3, 16h, 16w]."""
+        m = self.meta
+        c4, h, w = noise.shape
+        x = noise.reshape(c4, -1).T.astype(np.float32).copy()
+        ids = [ids_image(h, w, 0)]
+        extra = []
+        for k, rgb in enumerate(references):
+            tokens, (rh, rw) = self.encode(rgb)
+            extra.append(tokens)
+            ids.append(ids_image(rh, rw, 10 * (k + 1)))
+        ids = np.concatenate(ids)
+        sg = sigmas(x.shape[0], steps)
+        for i in range(steps):
+            v = self.transformer(text, np.concatenate([x] + extra), ids, float(sg[i]))[:x.shape[0]]
+            x = x + (sg[i + 1] - sg[i]) * v
+            if progress:
+                progress(i + 1, steps)
+        z = x.T.reshape(c4, h, w)
+        z = z * np.array(m['bn_std'], np.float32)[:, None, None] + np.array(m['bn_mean'], np.float32)[:, None, None]
+        return self.run(self.net('klein-dec'), [unpatchify(z)])

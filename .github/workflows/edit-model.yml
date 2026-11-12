@@ -23,11 +23,16 @@ on:
       jobs:
         description: Which parts to build
         type: choice
-        options: ["both", "text", "image"]
-        default: "both"
+        options: ["all", "text", "image", "check"]
+        default: "all"
+      artifacts_run:
+        description: "For 'check' alone: the run id whose text and image artifacts to use"
+        required: false
+        default: ""
 
 permissions:
   contents: read
+  actions: read
 
 env:
   NCNN_TAG: "20261020"
@@ -49,7 +54,7 @@ env:
 jobs:
   text:
     name: Text encoder
-    if: inputs.jobs != 'image'
+    if: inputs.jobs == 'all' || inputs.jobs == 'text'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
@@ -102,7 +107,7 @@ jobs:
 
   image:
     name: Transformer
-    if: inputs.jobs != 'text'
+    if: inputs.jobs == 'all' || inputs.jobs == 'image'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
@@ -135,6 +140,8 @@ jobs:
           mkdir -p results
           bash -c "$MONITOR" &
           cd bm/tools/edit
+          python3 klein_export.py --stage vae --repo "$REPO" --out "$DIST" --check 2>&1 \
+            | grep --line-buffered -v -i "warn\|^\s*$\|^ \|pnnx\|=\|#\|│\|─\|┌\|└\|├" | tee ../../../results/log-vae.txt
           nice -n 10 /usr/bin/time -v -o ../../../results/time-image.txt python3 klein_export.py --stage image --repo "$REPO" \
             --out "$DIST" --check \
             --quantizer ../../../ncnn-build/tools/quantize/ncnnllm2int --bits "${{ inputs.bits }}" --block "${{ inputs.block }}" \
@@ -151,4 +158,64 @@ jobs:
         if: always()
         with:
           name: logs-image
+          path: results
+
+  check:
+    name: Pictures against PyTorch
+    needs: [text, image]
+    # Runs after both, or alone on an earlier run's artifacts.
+    if: always() && (inputs.jobs == 'check' || (needs.text.result == 'success' && needs.image.result == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bm
+      - name: Disk and swap
+        run: |
+          SWAP_FILE=/mnt/swapfile bash bm/tools/create/runner-setup.sh 32
+          sudo mkdir -p /mnt/tmp /mnt/dist /mnt/hf /mnt/work && sudo chown "$(id -u):$(id -g)" /mnt/tmp /mnt/dist /mnt/hf /mnt/work
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          pip install $TORCH_INSTALL
+          pip install $PY_PACKAGES
+      - name: The pieces
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "{text,image}"
+          path: /mnt/dist
+          merge-multiple: true
+          run-id: ${{ inputs.artifacts_run || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Test pictures
+        run: |
+          ls -la /mnt/dist
+          gh release download create-test -R "$GITHUB_REPOSITORY" -p "create-test-outputs.zip" -D zip
+          mkdir -p inputs && unzip -q -j zip/create-test-outputs.zip "sana-1.6b/inputs/*" -d inputs && ls inputs
+      - name: PyTorch reference
+        timeout-minutes: 100
+        run: |
+          set -o pipefail
+          mkdir -p results
+          bash -c "$MONITOR" &
+          nice -n 10 python3 bm/tools/edit/klein_check.py reference "$REPO" /mnt/work inputs 2>&1 \
+            | grep --line-buffered -v -i "warn" | tee results/log-reference.txt
+          rm -rf /mnt/hf
+      - name: The pieces on the same prompts and noise
+        timeout-minutes: 180
+        run: |
+          set -o pipefail
+          bash -c "$MONITOR" &
+          nice -n 10 python3 bm/tools/edit/klein_check.py pieces /mnt/dist /mnt/work results 2>&1 \
+            | grep --line-buffered -v -i "warn" | tee results/log-pieces.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: check
           path: results

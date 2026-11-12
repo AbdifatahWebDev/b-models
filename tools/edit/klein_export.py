@@ -324,6 +324,76 @@ def export_transformer(tr, nt, a, work, singles_per_piece):
     return meta
 
 
+# ---------------------------------------------------------------- VAE (AutoencoderKLFlux2)
+
+class VaeEncode(nn.Module):
+    """RGB in [-1, 1] [1, 3, H, W] -> the latent mean [1, C, H/8, W/8] (the pipeline's "argmax")."""
+
+    def __init__(self, vae):
+        super().__init__()
+        self.encoder, self.quant, self.c = vae.encoder, vae.quant_conv, vae.config.latent_channels
+
+    def forward(self, x):
+        z = self.encoder(x)
+        if self.quant is not None:
+            z = self.quant(z)
+        return torch.tensor_split(z, (self.c,), dim=1)[0] + torch.tensor_split(z, (self.c,), dim=1)[1][:, :1, :1, :1] * 0.0
+
+
+class VaeDecode(nn.Module):
+    """Latent [1, C, h, w] -> RGB in [-1, 1] [1, 3, 8h, 8w]."""
+
+    def __init__(self, vae):
+        super().__init__()
+        self.decoder, self.post = vae.decoder, vae.post_quant_conv
+
+    def forward(self, z):
+        return self.decoder(z if self.post is None else self.post(z))
+
+
+def random_vae():
+    from diffusers import AutoencoderKLFlux2
+    torch.manual_seed(2)
+    return AutoencoderKLFlux2(block_out_channels=(8, 16), down_block_types=('DownEncoderBlock2D',) * 2,
+                              up_block_types=('UpDecoderBlock2D',) * 2, layers_per_block=1, latent_channels=2,
+                              norm_num_groups=4).eval()
+
+
+def export_vae(vae, a, work):
+    """klein-enc and klein-dec, traced at two small sizes and checked at a third; meta-vae.json has
+    the batch-norm statistics the latents are normalised with after the 2x2 patchify."""
+    import klein_ncnn
+    vae = vae.float()
+    cfg = vae.config
+    c = cfg.latent_channels
+    f = 2 ** (len(cfg.block_out_channels) - 1)
+    s1, s2, s3 = (2, 3, 4) if a.random else (8, 12, 16)  # latent sides: traced, traced, checked
+    pnnx_export(VaeEncode(vae), (torch.randn(1, 3, s1 * f, s1 * f),), (torch.randn(1, 3, s2 * f, s3 * f),),
+                os.path.join(a.out, 'klein-enc'), work, fp16=not a.random)
+    print('exported klein-enc', flush=True)
+    pnnx_export(VaeDecode(vae), (torch.randn(1, c, s1, s1),), (torch.randn(1, c, s2, s3),),
+                os.path.join(a.out, 'klein-dec'), work, fp16=not a.random)
+    print('exported klein-dec', flush=True)
+    std = torch.sqrt(vae.bn.running_var + cfg.batch_norm_eps)
+    meta = {'vae_channels': c, 'vae_scale': f, 'bn_mean': vae.bn.running_mean.tolist(), 'bn_std': std.tolist()}
+    with open(os.path.join(a.out, 'meta-vae.json'), 'w') as fh:
+        json.dump(meta, fh)
+    if a.check:
+        torch.manual_seed(5)
+        x = torch.rand(1, 3, s3 * f, s2 * f) * 2 - 1
+        z = VaeEncode(vae)(x)
+        y = VaeDecode(vae)(z)
+        p = klein_ncnn.Pieces(a.out)
+        gz = p.run(p.net('klein-enc'), [x[0].numpy()])
+        gy = p.run(p.net('klein-dec'), [z[0].numpy()])
+        ez = float(np.abs(gz - z[0].numpy()).max() / (np.abs(z[0].numpy()).max() + 1e-9))
+        ey = float(np.abs(gy - y[0].numpy()).max())
+        print(f'vae check at {s3 * f}x{s2 * f}: encoder relative difference {ez:.4f}, decoder max difference {ey:.4f} (pixels in [-1, 1])')
+        if gz.shape != z[0].shape or gy.shape != y[0].shape or ez > 0.05 or ey > 0.05:
+            raise SystemExit('the VAE does not match PyTorch')
+    return meta
+
+
 def random_text():
     """A tiny random Qwen3 and a real byte-level BPE tokenizer with Qwen's chat template."""
     from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers
@@ -352,7 +422,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--repo', default='black-forest-labs/FLUX.2-klein-4B')
     ap.add_argument('--out', required=True)
-    ap.add_argument('--stage', choices=['text', 'image', 'all'], default='text')
+    ap.add_argument('--stage', choices=['text', 'image', 'vae', 'all'], default='text')
     ap.add_argument('--singles-per-piece', type=int, default=4)
     ap.add_argument('--random', action='store_true', help='tiny random models: tests the export and the pieces')
     ap.add_argument('--tokens', type=int, default=512, help="prompt tokens, padded (the pipeline's max_sequence_length)")
@@ -369,6 +439,15 @@ def main():
 
     if a.random:
         a.tokens = min(a.tokens, 48)
+    if a.stage in ('vae', 'all'):
+        if a.random:
+            vae = random_vae()
+        else:
+            from diffusers import AutoencoderKLFlux2
+            vae = AutoencoderKLFlux2.from_pretrained(a.repo, subfolder='vae', torch_dtype=torch.float32).eval()
+        export_vae(vae, a, work)
+        if a.stage == 'vae':
+            return
     if a.stage in ('image', 'all'):
         if a.random:
             tr = random_transformer(joint=3 * 64)
@@ -378,12 +457,12 @@ def main():
         print(f'transformer: {len(tr.transformer_blocks)} double + {len(tr.single_transformer_blocks)} single blocks, '
               f'width {tr.inner_dim}, heads {tr.config.num_attention_heads} x {tr.config.attention_head_dim}')
         export_transformer(tr, a.tokens, a, work, a.singles_per_piece)
-        del tr
         if a.stage == 'image':
             return
 
     if a.random:
         model, tok = random_text()
+        random_text_models = (model, tok)
     else:
         from transformers import AutoModel, AutoTokenizer
         tok = AutoTokenizer.from_pretrained(a.repo, subfolder='tokenizer')
@@ -443,8 +522,9 @@ def main():
     if a.check:
         import gc
         import klein_ncnn
-        del model  # 8 GB the check does not need
-        gc.collect()
+        if not a.random:
+            del model  # 8 GB the check does not need
+            gc.collect()
         got = klein_ncnn.Pieces(a.out).text(ids, real)
         want32 = np.concatenate(kept32, axis=1)
 
@@ -466,6 +546,32 @@ def main():
         # norm in klein 4B) and unstable, bf16 against fp32 alone moves single ones to 0.76.
         if min(quant[:real]) < (0.999 if a.random else 0.98) or np.mean(quant[real:] or [1]) < 0.9:
             raise SystemExit('the text pieces do not match PyTorch')
+
+    if a.random and a.check and a.stage == 'all':
+        # The whole pipeline on the tiny models: words to picture, then an edit with a reference.
+        import klein_ncnn
+        from diffusers import FlowMatchEulerDiscreteScheduler, Flux2KleinPipeline
+        from PIL import Image
+        model, tok = random_text_models
+        sched = FlowMatchEulerDiscreteScheduler(base_image_seq_len=256, base_shift=0.5, max_image_seq_len=4096, max_shift=1.15,
+                                                shift=3.0, time_shift_type='exponential', use_dynamic_shifting=True)
+        pipe = Flux2KleinPipeline(scheduler=sched, vae=vae, text_encoder=model, tokenizer=tok, transformer=tr, is_distilled=True)
+        pipe.set_progress_bar_config(disable=True)
+        p = klein_ncnn.Pieces(a.out)
+        emb, ids_, real_ = reference(model, tok, 'a red fox in fresh snow', a.tokens)
+        text = p.text(ids_, real_)
+        rng = np.random.default_rng(7)
+        ref_img = Image.fromarray(rng.integers(0, 255, (64, 80, 3), dtype=np.uint8))
+        ref = np.asarray(ref_img, np.float32).transpose(2, 0, 1) / 127.5 - 1
+        for name, refs, pil in (('create', [], None), ('edit', [ref], [ref_img])):
+            noise = torch.randn(1, tr.config.in_channels, 64 // 4, 64 // 4, generator=torch.Generator().manual_seed(11))
+            want = pipe(image=pil, prompt_embeds=torch.from_numpy(emb)[None], latents=noise.clone(), height=64, width=64,
+                        num_inference_steps=4, guidance_scale=1.0, output_type='pt').images[0].numpy() * 2 - 1
+            got = np.clip(p.generate(text, noise[0].numpy(), refs), -1, 1)
+            err = float(np.abs(got - want).max())
+            print(f'pipeline check, {name}: max difference {err:.4f} (pixels in [-1, 1])')
+            if got.shape != want.shape or err > 0.03:
+                raise SystemExit('the pieces do not make the picture the pipeline makes')
 
 
 if __name__ == '__main__':

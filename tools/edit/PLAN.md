@@ -96,3 +96,11 @@ Text ids are (0,0,0,i); image (0,y,x,0); reference k has t = 10·(k+1) (check _p
   klein_ncnn.py (sigmas linspace(1, 1/n, n) shifted by mu = compute_empirical_mu(tokens, steps),
   Euler steps on velocity, latents × bn_std + bn_mean, 2×2 unpatchify, decode), a check job that
   compares a picture and edits against the pipeline from the same noise, then the release.
+- Step 3 written: klein_export.py --stage vae (klein-enc, klein-dec, meta-vae.json with the
+  batch-norm mean/std), klein_ncnn.Pieces.encode/generate (sigmas, Euler, patchify), and
+  klein_check.py (reference in PyTorch, then the pieces on the same embeddings' prompts and
+  noise; fox from words and the dress try-on). Tiny self-test: `klein_export.py --random
+  --check --stage all` matches Flux2KleinPipeline exactly, create and edit (max difference 0).
+  Workflow: image job also exports the VAE; check job after both (or alone with artifacts_run).
+- After the check: C++ byte-level BPE tokenizer for Qwen (vocab + merges file), release
+  `edit-model`, engine/edit.cpp, Create screen model choice and "Add photos"; then the KV cache.
