@@ -1,0 +1,92 @@
+name: Edit model (FLUX.2 klein 4B)
+
+# Builds Brekwol Upscale's edit model from FLUX.2 klein 4B (Black Forest Labs, Apache-2.0) with
+# tools/edit/klein_export.py; see tools/edit/PLAN.md. So far the text encoder only:
+#   text   Qwen3-4B's first 27 layers in pieces of three, block-quantized by ncnn's ncnnllm2int,
+#          int8 embedding rows, and a check of the pieces against PyTorch.
+# Every job prints memory and disk use each minute. Started by hand only.
+on:
+  workflow_dispatch:
+    inputs:
+      bits:
+        description: Text encoder weight bits
+        type: choice
+        options: ["8", "6", "4"]
+        default: "8"
+      block:
+        description: Quantization block size
+        type: choice
+        options: ["64", "32", "128"]
+        default: "64"
+
+permissions:
+  contents: read
+
+env:
+  NCNN_TAG: "20261020"
+  REPO: black-forest-labs/FLUX.2-klein-4B
+  HF_HOME: /mnt/hf
+  TMPDIR: /mnt/tmp
+  DIST: /mnt/dist
+  PYTHONUNBUFFERED: "1"
+  # Leave a core for the runner itself.
+  OMP_NUM_THREADS: "3"
+  TORCH_INSTALL: torch==2.15.0 torchvision --index-url https://download.pytorch.org/whl/cpu
+  PY_PACKAGES: diffusers==0.42.1 transformers==5.22.2 accelerate==1.15.0 safetensors sentencepiece protobuf pillow numpy ncnn==1.0.20261020 pnnx==20261020
+  MONITOR: |
+    while true; do
+      echo "[monitor $(date -u +%H:%M:%S)] $(free -m | awk '/Mem/{printf "memory %d/%d MB", $3, $2} /Swap/{printf ", swap %d MB", $3}'), $(df -h / | awk 'NR>1{printf "%s %s free  ", $6, $4}')"
+      sleep 60
+    done
+
+jobs:
+  text:
+    name: Text encoder
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bm
+      - name: Disk and swap
+        run: |
+          SWAP_FILE=/mnt/swapfile bash bm/tools/create/runner-setup.sh 24
+          sudo mkdir -p /mnt/tmp /mnt/dist /mnt/hf && sudo chown "$(id -u):$(id -g)" /mnt/tmp /mnt/dist /mnt/hf
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          pip install $TORCH_INSTALL
+          pip install $PY_PACKAGES
+      - name: ncnn block quantizer (ncnnllm2int)
+        run: |
+          git clone -q --depth 1 --branch "$NCNN_TAG" https://github.com/Tencent/ncnn ncnn-src
+          cmake -S ncnn-src -B ncnn-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNCNN_VULKAN=OFF -DNCNN_BUILD_TOOLS=ON \
+            -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_BENCHMARK=OFF -DNCNN_BUILD_TESTS=OFF -DNCNN_SIMPLEOCV=ON -DNCNN_PYTHON=OFF > /dev/null
+          cmake --build ncnn-build --target ncnnllm2int -j "$(nproc)" > /dev/null
+      - name: Convert and check the text encoder
+        timeout-minutes: 120
+        run: |
+          set -o pipefail
+          mkdir -p results
+          bash -c "$MONITOR" &
+          cd bm/tools/edit
+          nice -n 10 /usr/bin/time -v -o ../../../results/time-text.txt python3 klein_export.py --stage text --repo "$REPO" \
+            --out "$DIST" --check \
+            --quantizer ../../../ncnn-build/tools/quantize/ncnnllm2int --bits "${{ inputs.bits }}" --block "${{ inputs.block }}" \
+            2>&1 | grep --line-buffered -v -i "warn\|^quantize_\|^\s*$\|^ \|pnnx\|=\|#\|│\|─\|┌\|└\|├" | tee ../../../results/log-text.txt
+          ls -la "$DIST"
+          (cd "$DIST" && sha256sum *) > ../../../results/sha256-text.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: text
+          path: /mnt/dist
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-text
+          path: results
