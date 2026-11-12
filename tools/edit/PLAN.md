@@ -79,3 +79,11 @@ Text ids are (0,0,0,i); image (0,y,x,0); reference k has t = 10·(k+1) (check _p
   whether fewer text tokens than 512 keep the quality.
 - VAE: AutoencoderKLFlux2 encoder and decoder, tiled like SANA's tail if it is all local;
   latents patchified 2×2 and normalised with vae.bn running stats.
+- Text run #2 (8-bit, block 64): real tokens cosine 0.9997 (min 0.9991) against fp32; padding
+  tokens mean 0.974, min 0.47, but bf16 against fp32 alone gives padding min 0.76: padding is
+  small (norms 28-145 against 640-760 for real tokens) and unstable. Accepted for now; the
+  end-to-end picture comparison (step 3) decides. Text job: ~15 min, under 9 GB.
+- Step 2 written: klein-time, klein-dNN, klein-sNN; tiny self-test exact (cosine 1.00000) at an
+  untraced length. Gotchas: ncnn.Mat(numpy) must be .clone()d (unaligned memory crashed in-place
+  layers in light mode); pnnx drops a plain x[:, nt:] slice (use tensor_split, and tie unused
+  halves in so they do not become outputs); pieces are deep-copied to fp32 from a bf16 model.

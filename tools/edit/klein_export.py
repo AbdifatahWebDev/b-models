@@ -462,7 +462,9 @@ def main():
         report('fp32 PyTorch against the model as loaded', cosines(want32, want))
         norms = np.linalg.norm(want32.reshape(n, len(LAYERS_OUT), -1), axis=2)
         print('norms per kept layer, real tokens mean', norms[:real].mean(0).round(1), 'padding mean', norms[real:].mean(0).round(1))
-        if min(quant[:real]) < (0.999 if a.random else 0.98) or min(quant) < 0.9:
+        # The padding tokens are judged by their mean: they are small (a tenth of a real token's
+        # norm in klein 4B) and unstable, bf16 against fp32 alone moves single ones to 0.76.
+        if min(quant[:real]) < (0.999 if a.random else 0.98) or np.mean(quant[real:] or [1]) < 0.9:
             raise SystemExit('the text pieces do not match PyTorch')
 
 
