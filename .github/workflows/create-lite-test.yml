@@ -1,0 +1,46 @@
+name: Create decoder test (DC-AE-Lite)
+
+# Is DC-AE-Lite's decoder a faster drop-in for SANA-Sprint's latents? Encodes the create-model
+# release's sample pictures with SANA-Sprint's DC-AE and decodes them with both decoders
+# (tools/create/lite_vae_test.py): times, PSNR and side-by-side pictures. Started by hand only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Decoders
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swap
+        run: SWAP_FILE=/mnt/swapfile bash tools/create/runner-setup.sh 16
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install diffusers==0.42.1 transformers==5.22.2 accelerate==1.15.0 safetensors pillow numpy
+      - name: Sample pictures
+        run: gh release download create-model -R "$GITHUB_REPOSITORY" -p "sample-*.png" -D samples
+      - name: Decode with both
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          mkdir -p out
+          python3 tools/create/lite_vae_test.py Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers \
+            mit-han-lab/dc-ae-lite-f32c32-sana-1.1-diffusers out samples/*.png 2>&1 | grep -v -i "warn" | tee out/log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lite-decoder-test
+          path: out
+          retention-days: 7
