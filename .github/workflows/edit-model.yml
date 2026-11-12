@@ -1,9 +1,11 @@
 name: Edit model (FLUX.2 klein 4B)
 
 # Builds Brekwol Upscale's edit model from FLUX.2 klein 4B (Black Forest Labs, Apache-2.0) with
-# tools/edit/klein_export.py; see tools/edit/PLAN.md. So far the text encoder only:
+# tools/edit/klein_export.py; see tools/edit/PLAN.md. So far, each in its own job:
 #   text   Qwen3-4B's first 27 layers in pieces of three, block-quantized by ncnn's ncnnllm2int,
-#          int8 embedding rows, and a check of the pieces against PyTorch.
+#          int8 embedding rows, and a check of the pieces against PyTorch;
+#   image  the transformer: a time piece, five double blocks and the twenty single blocks in
+#          pieces of four, block-quantized, and a check of one call against PyTorch.
 # Every job prints memory and disk use each minute. Started by hand only.
 on:
   workflow_dispatch:
@@ -18,6 +20,11 @@ on:
         type: choice
         options: ["64", "32", "128"]
         default: "64"
+      jobs:
+        description: Which parts to build
+        type: choice
+        options: ["both", "text", "image"]
+        default: "both"
 
 permissions:
   contents: read
@@ -42,6 +49,7 @@ env:
 jobs:
   text:
     name: Text encoder
+    if: inputs.jobs != 'image'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
@@ -90,4 +98,57 @@ jobs:
         if: always()
         with:
           name: logs-text
+          path: results
+
+  image:
+    name: Transformer
+    if: inputs.jobs != 'text'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bm
+      - name: Disk and swap
+        run: |
+          SWAP_FILE=/mnt/swapfile bash bm/tools/create/runner-setup.sh 32
+          sudo mkdir -p /mnt/tmp /mnt/dist /mnt/hf && sudo chown "$(id -u):$(id -g)" /mnt/tmp /mnt/dist /mnt/hf
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          pip install $TORCH_INSTALL
+          pip install $PY_PACKAGES
+      - name: ncnn block quantizer (ncnnllm2int)
+        run: |
+          git clone -q --depth 1 --branch "$NCNN_TAG" https://github.com/Tencent/ncnn ncnn-src
+          cmake -S ncnn-src -B ncnn-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNCNN_VULKAN=OFF -DNCNN_BUILD_TOOLS=ON \
+            -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_BENCHMARK=OFF -DNCNN_BUILD_TESTS=OFF -DNCNN_SIMPLEOCV=ON -DNCNN_PYTHON=OFF > /dev/null
+          cmake --build ncnn-build --target ncnnllm2int -j "$(nproc)" > /dev/null
+      - name: Convert and check the transformer
+        timeout-minutes: 120
+        run: |
+          set -o pipefail
+          mkdir -p results
+          bash -c "$MONITOR" &
+          cd bm/tools/edit
+          nice -n 10 /usr/bin/time -v -o ../../../results/time-image.txt python3 klein_export.py --stage image --repo "$REPO" \
+            --out "$DIST" --check \
+            --quantizer ../../../ncnn-build/tools/quantize/ncnnllm2int --bits "${{ inputs.bits }}" --block "${{ inputs.block }}" \
+            2>&1 | grep --line-buffered -v -i "warn\|^quantize_\|^\s*$\|^ \|pnnx\|=\|#\|│\|─\|┌\|└\|├" | tee ../../../results/log-image.txt
+          ls -la "$DIST"
+          (cd "$DIST" && sha256sum *) > ../../../results/sha256-image.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: image
+          path: /mnt/dist
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-image
           path: results
