@@ -167,6 +167,9 @@ jobs:
     if: always() && (inputs.jobs == 'check' || (needs.text.result == 'success' && needs.image.result == 'success'))
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    permissions:
+      contents: write  # the pictures go to the edit-check release
+      actions: read
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       GH_TOKEN: ${{ github.token }}
@@ -219,3 +222,10 @@ jobs:
         with:
           name: check
           path: results
+      - name: Publish the pictures (release edit-check)
+        if: always()
+        run: |
+          cd results && ls -la
+          gh release delete edit-check -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create edit-check -R "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
+            --title "Edit model check" --notes "Test pictures of the edit model's pieces against PyTorch (run $GITHUB_RUN_ID). Not a model release." ./*

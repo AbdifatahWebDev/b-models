@@ -563,7 +563,10 @@ def main():
         rng = np.random.default_rng(7)
         ref_img = Image.fromarray(rng.integers(0, 255, (64, 80, 3), dtype=np.uint8))
         ref = np.asarray(ref_img, np.float32).transpose(2, 0, 1) / 127.5 - 1
-        for name, refs, pil in (('create', [], None), ('edit', [ref], [ref_img])):
+        # Two references of other shapes, one with an odd token grid and far more tokens than traced.
+        big = [Image.fromarray(rng.integers(0, 255, s + (3,), dtype=np.uint8)) for s in ((148, 112), (96, 120))]
+        bigs = [np.asarray(i, np.float32).transpose(2, 0, 1) / 127.5 - 1 for i in big]
+        for name, refs, pil in (('create', [], None), ('edit', [ref], [ref_img]), ('two references', bigs, big)):
             noise = torch.randn(1, tr.config.in_channels, 64 // 4, 64 // 4, generator=torch.Generator().manual_seed(11))
             want = pipe(image=pil, prompt_embeds=torch.from_numpy(emb)[None], latents=noise.clone(), height=64, width=64,
                         num_inference_steps=4, guidance_scale=1.0, output_type='pt').images[0].numpy() * 2 - 1

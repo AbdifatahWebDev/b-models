@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Runs the edit model's ncnn pieces the way the phone will (see klein_export.py, PLAN.md).
 
-So far: Pieces.text(ids, real) -> the transformer's text input [tokens, 3 * hidden].
+Pieces.text(ids, real) -> the transformer's text input; Pieces.generate(text, noise, references)
+-> the picture.
 """
 import json
 import math
@@ -161,9 +162,10 @@ class Pieces:
         z = (z - np.array(m['bn_mean'], np.float32)[:, None, None]) / np.array(m['bn_std'], np.float32)[:, None, None]
         return z.reshape(z.shape[0], -1).T.copy(), z.shape[1:]
 
-    def generate(self, text, noise, references=(), steps=4, progress=None):
+    def generate(self, text, noise, references=(), steps=4, progress=None, trace=None):
         """text [nt, J]; noise [4C, h, w] standard normal (the pipeline's latents); references:
-        RGB arrays in [-1, 1] -> RGB in [-1, 1] [3, 16h, 16w]."""
+        RGB arrays in [-1, 1] -> RGB in [-1, 1] [3, 16h, 16w]. trace(step, tokens in, model out, t)
+        sees every model call (for the checks)."""
         m = self.meta
         c4, h, w = noise.shape
         x = noise.reshape(c4, -1).T.astype(np.float32).copy()
@@ -176,8 +178,11 @@ class Pieces:
         ids = np.concatenate(ids)
         sg = sigmas(x.shape[0], steps)
         for i in range(steps):
-            v = self.transformer(text, np.concatenate([x] + extra), ids, float(sg[i]))[:x.shape[0]]
-            x = x + (sg[i + 1] - sg[i]) * v
+            tokens = np.concatenate([x] + extra)
+            full = self.transformer(text, tokens, ids, float(sg[i]))
+            if trace:
+                trace(i, tokens, full, float(sg[i]))
+            x = x + (sg[i + 1] - sg[i]) * full[:x.shape[0]]
             if progress:
                 progress(i + 1, steps)
         z = x.T.reshape(c4, h, w)

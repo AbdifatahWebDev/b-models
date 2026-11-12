@@ -104,3 +104,14 @@ Text ids are (0,0,0,i); image (0,y,x,0); reference k has t = 10·(k+1) (check _p
   Workflow: image job also exports the VAE; check job after both (or alone with artifacts_run).
 - After the check: C++ byte-level BPE tokenizer for Qwen (vocab + merges file), release
   `edit-model`, engine/edit.cpp, Create screen model choice and "Add photos"; then the KV cache.
+- Run #4 (77f24d9): text and image jobs pass (VAE: encoder 0.0001, decoder 0.0006; one
+  transformer call 0.9978); the check job died on `rm -rf /mnt/hf` (fixed).
+- Run #5 (check alone on run #4's pieces, 2-core runner under swap for PyTorch):
+  fox from words: 25.7 dB against PyTorch, pieces 24 s text + 294 s picture (70 s a step),
+  peak 3.1 GB; PyTorch 908 s, 15.5 GB. Dress try-on (two references): PSNR 2.0 dB = broken
+  (probably not finite), 194 s a step, peak 5.6 GB. The tiny self-test with two references of
+  odd shapes is exact, so it is the real weights or sizes. The check now traces every model call
+  against PyTorch (inputs, reference tokens, outputs, not-finite counts) and publishes its
+  pictures to the `edit-check` release (artifacts cannot be downloaded from the session).
+- The session's container can be rebuilt with older packages: the tiny self-test needs the
+  workflow's versions (pnnx 20261020, ncnn 1.0.20261020, diffusers 0.42.1) or the text check fails.

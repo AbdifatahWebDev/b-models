@@ -70,10 +70,24 @@ def reference(repo, work, inputs):
             im.save(os.path.join(work, f'{key}-in-{s}.png'))
         noise = torch.randn(1, pipe.transformer.config.in_channels, 32, 32, generator=torch.Generator().manual_seed(SEED))
         np.save(os.path.join(work, f'{key}-noise.npy'), noise[0].numpy())
+        # Every model call's input and output, so the pieces can be compared step by step.
+        calls = {}
+        inner = pipe.transformer.forward
+
+        def traced(*a, _inner=inner, _calls=calls, **k):
+            out = _inner(*a, **k)
+            i = len(_calls) // 3
+            _calls[f'x{i}'] = k['hidden_states'][0].float().numpy()
+            _calls[f'v{i}'] = out[0][0].float().numpy()
+            _calls[f't{i}'] = np.float32(k['timestep'].float().reshape(-1)[0].item())
+            return out
+        pipe.transformer.forward = traced
         t = time.time()
         img = pipe(image=imgs or None, prompt_embeds=torch.from_numpy(embeds[key])[None], latents=noise.clone(),
                    height=512, width=512, num_inference_steps=STEPS, guidance_scale=1.0).images[0]
         times[key] = round(time.time() - t, 1)
+        pipe.transformer.forward = inner
+        np.savez(os.path.join(work, f'{key}-trace.npz'), **calls)
         img.save(os.path.join(work, f'{key}-reference.png'))
         print(f'{key}: PyTorch {times[key]} s, peak {peak_gb():.1f} GB', flush=True)
     json.dump(times, open(os.path.join(work, 'times-reference.json'), 'w'))
@@ -97,8 +111,29 @@ def pieces(dist, work, out):
         refs = [np.asarray(Image.open(os.path.join(work, f'{key}-in-{s}.png')).convert('RGB'), np.float32).transpose(2, 0, 1) / 127.5 - 1
                 for s in srcs]
         noise = np.load(os.path.join(work, f'{key}-noise.npy'))
+        tp = os.path.join(work, f'{key}-trace.npz')
+        want_calls = np.load(tp) if os.path.exists(tp) else None
+
+        def cosine(a, b):
+            return float((a * b).sum() / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+
+        def trace(i, tokens, out, sigma, n=noise.shape[1] * noise.shape[2]):
+            bad = int((~np.isfinite(tokens)).sum() + (~np.isfinite(out)).sum())
+            line = f'  {key}: call {i}, t {sigma:.4f}, in range {np.abs(tokens).max():.1f}, out range {np.abs(out).max():.1f}, not finite {bad}'
+            if want_calls is not None and f'x{i}' in want_calls:
+                wx, wv = want_calls[f'x{i}'], want_calls[f'v{i}']
+                if wx.shape == tokens.shape and wv.shape == out.shape:
+                    line += (f'; against PyTorch (t {float(want_calls[f"t{i}"]):.4f}): in picture {cosine(tokens[:n], wx[:n]):.4f}'
+                             + (f', in references {cosine(tokens[n:], wx[n:]):.4f} (range {np.abs(wx[n:]).max():.1f})' if len(tokens) > n else '')
+                             + f', out picture {cosine(out[:n], wv[:n]):.4f}')
+                else:
+                    line += f'; shapes differ from PyTorch: in {tokens.shape} / {wx.shape}, out {out.shape} / {wv.shape}'
+            print(line, flush=True)
+
         t = time.time()
-        img = p.generate(text, noise, refs, STEPS, progress=lambda i, n: print(f'  {key}: step {i}/{n}, {time.time() - t:.0f} s', flush=True))
+        img = p.generate(text, noise, refs, STEPS, trace=trace,
+                         progress=lambda i, n: print(f'  {key}: step {i}/{n}, {time.time() - t:.0f} s', flush=True))
+        print(f'  {key}: picture range {np.nanmin(img):.2f} .. {np.nanmax(img):.2f}, not finite {int((~np.isfinite(img)).sum())}', flush=True)
         t_img = time.time() - t
         got = Image.fromarray(((np.clip(img, -1, 1).transpose(1, 2, 0) + 1) * 127.5).round().astype(np.uint8))
         got.save(os.path.join(out, f'{key}-pieces.png'))
