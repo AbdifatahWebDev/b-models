@@ -168,8 +168,20 @@ def main():
     n, H = a.tokens, cfg.hidden_size
     last = max(LAYERS_OUT)
     pieces = []
+    # A second reference for the check: the same layers in fp32 in PyTorch, fed the int8 embedding
+    # rows. Against it the pieces show only what quantizing the weights costs; the model itself
+    # runs in bf16, whose rounding shows up on the padding tokens.
+    x32, kept32 = None, []
+    if a.check:
+        x32 = torch.from_numpy(emb_q[ids].astype(np.float32) * emb_scale[ids, None]).unsqueeze(0)
+        cos32, sin32 = rope(cfg, range(n))
+        mask32 = prompt_mask(n, real).unsqueeze(0)
     for first in range(0, last, a.layers_per_piece):
         m = QwenLayers(model, first, first + a.layers_per_piece)
+        if a.check:
+            x32 = m(x32, cos32.unsqueeze(0), sin32.unsqueeze(0), mask32)
+            if first + a.layers_per_piece in LAYERS_OUT:
+                kept32.append(x32[0].numpy().copy())
         stem = os.path.join(a.out, f'qwen-{len(pieces):02d}')
         cos, sin = rope(cfg, range(n))
         # --random: fp32 weights, so the check tests the graph, not rounding (as in sana_export.py).
@@ -197,10 +209,23 @@ def main():
         del model  # 8 GB the check does not need
         gc.collect()
         got = klein_ncnn.Pieces(a.out).text(ids, real)
-        cosines = [float(np.dot(got[i], want[i]) / (np.linalg.norm(got[i]) * np.linalg.norm(want[i]) + 1e-12)) for i in range(n)]
-        print(f'text check ({real} real tokens of {n}): cosine min {min(cosines):.5f}, mean {np.mean(cosines):.5f}; '
-              f'real tokens min {min(cosines[:real]):.5f}, padding min {min(cosines[real:] or [1]):.5f}')
-        if min(cosines) < (0.999 if a.random else 0.98):
+        want32 = np.concatenate(kept32, axis=1)
+
+        def cosines(x, y):
+            return [float(np.dot(x[i], y[i]) / (np.linalg.norm(x[i]) * np.linalg.norm(y[i]) + 1e-12)) for i in range(n)]
+
+        def report(name, c):
+            print(f'{name}: real tokens min {min(c[:real]):.5f} mean {np.mean(c[:real]):.5f}; '
+                  f'padding min {min(c[real:] or [1]):.5f} mean {np.mean(c[real:] or [1]):.5f}')
+
+        print(f'text check, {real} real tokens of {n}')
+        quant = cosines(got, want32)
+        report('pieces against fp32 PyTorch (cost of quantizing)', quant)
+        report('pieces against the model as loaded', cosines(got, want))
+        report('fp32 PyTorch against the model as loaded', cosines(want32, want))
+        norms = np.linalg.norm(want32.reshape(n, len(LAYERS_OUT), -1), axis=2)
+        print('norms per kept layer, real tokens mean', norms[:real].mean(0).round(1), 'padding mean', norms[real:].mean(0).round(1))
+        if min(quant[:real]) < (0.999 if a.random else 0.98) or min(quant) < 0.9:
             raise SystemExit('the text pieces do not match PyTorch')
 
 

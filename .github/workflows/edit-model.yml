@@ -81,6 +81,7 @@ jobs:
           ls -la "$DIST"
           (cd "$DIST" && sha256sum *) > ../../../results/sha256-text.txt
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: text
           path: /mnt/dist
